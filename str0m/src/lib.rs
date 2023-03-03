@@ -74,7 +74,7 @@ use thiserror::Error;
 
 pub use ice::IceConnectionState;
 
-pub use ice::Candidate;
+pub use ice::{Candidate, CandidateKind};
 pub use sdp::{Answer, Offer};
 
 /// Network related types to get socket data in/out of [`Rtc`].
