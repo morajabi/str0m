@@ -192,7 +192,11 @@ impl Candidate {
     /// Creates a relayed ICE candidate.
     ///
     /// Relayed candidates are server sockets relaying traffic to a local socket. Allocate a TURN addr to use as a local candidate.
-    pub fn relayed(addr: SocketAddr, network_type: String) -> Result<Self, IceError> {
+    pub fn relayed(
+        addr: SocketAddr,
+        base: SocketAddr,
+        network_type: String,
+    ) -> Result<Self, IceError> {
         if !is_valid_ip(addr.ip()) {
             return Err(IceError::BadCandidate(format!("invalid ip {}", addr.ip())));
         }
@@ -203,7 +207,7 @@ impl Candidate {
             network_type.into(),
             None,
             addr,
-            Some(addr),
+            Some(base),
             CandidateKind::Relayed,
             None,
             None,
