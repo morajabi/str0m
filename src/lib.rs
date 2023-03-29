@@ -499,7 +499,7 @@ use thiserror::Error;
 pub use ice::{IceConnectionState, IceCreds};
 
 pub use dtls::Fingerprint;
-pub use ice::Candidate;
+pub use ice::{Candidate, CandidateKind};
 pub use rtp::Bitrate;
 
 /// Network related types to get socket data in/out of [`Rtc`].
