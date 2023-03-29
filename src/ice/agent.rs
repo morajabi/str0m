@@ -900,8 +900,14 @@ impl IceAgent {
                 next
             }
         } else {
+            // Check quicker while connecting
+            let idle_duration = if self.state == IceConnectionState::Checking {
+                Duration::from_millis(500)
+            } else {
+                Duration::from_secs(3)
+            };
             // IDLE for a while.
-            last_now + Duration::from_secs(3)
+            last_now + idle_duration
         };
 
         Some(next)
