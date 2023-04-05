@@ -505,7 +505,6 @@ pub use ice::IceConnectionState;
 
 pub use dtls::Fingerprint;
 pub use ice::Candidate;
-pub use ice::CandidateKind;
 pub use rtp::Bitrate;
 
 /// Network related types to get socket data in/out of [`Rtc`].

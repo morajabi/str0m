@@ -7,7 +7,8 @@ mod agent;
 pub use agent::{IceAgent, IceAgentEvent, IceAgentStats, IceConnectionState, IceCreds};
 
 mod candidate;
-pub use candidate::{Candidate, CandidateKind};
+pub use candidate::Candidate;
+pub(crate) use candidate::CandidateKind;
 
 mod pair;
 

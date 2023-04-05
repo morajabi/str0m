@@ -96,7 +96,7 @@ impl fmt::Debug for Candidate {
 
 impl Candidate {
     #[allow(clippy::too_many_arguments)]
-    pub fn new(
+    fn new(
         foundation: Option<String>,
         component_id: u16,
         proto: String,
@@ -377,6 +377,7 @@ impl Candidate {
     }
 }
 
+/// Candidate type
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum CandidateKind {
     Host,
