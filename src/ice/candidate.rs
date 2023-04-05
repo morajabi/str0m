@@ -380,9 +380,13 @@ impl Candidate {
 /// Candidate type
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum CandidateKind {
+    /// host
     Host,
+    /// prflx
     PeerReflexive,
+    /// srflx
     ServerReflexive,
+    /// relay
     Relayed,
 }
 
