@@ -8,8 +8,12 @@ use std::ops::Deref;
 use std::str::FromStr;
 
 use crate::dtls::Fingerprint;
+use crate::format::Codec;
+use crate::format::CodecSpec;
+use crate::format::FormatParams;
+use crate::format::PayloadParams;
 use crate::ice::{Candidate, IceCreds};
-use crate::rtp::{Direction, ExtMap, Mid, Pt, SessionId, Ssrc};
+use crate::rtp::{Direction, Extension, Mid, Pt, SessionId, Ssrc};
 
 use super::parser::sdp_parser;
 use super::SdpError;
@@ -193,6 +197,10 @@ pub enum SessionAttribute {
         typ: String,    // BUNDLE, LS etc
         mids: Vec<Mid>, // 0 1 2 3
     },
+    MsidSemantic {
+        semantic: String, // WMS
+        stream_ids: Vec<String>,
+    },
     IceLite,
     IceUfrag(String),
     IcePwd(String),
@@ -263,8 +271,8 @@ impl MediaLine {
             .attrs
             .iter()
             .filter_map(|a| {
-                if let MediaAttribute::RtpMap(c) = a {
-                    Some(c)
+                if let MediaAttribute::RtpMap { pt, value: c } = a {
+                    Some((*pt, *c))
                 } else {
                     None
                 }
@@ -297,25 +305,27 @@ impl MediaLine {
 
         let mut params: Vec<_> = rtp_maps
             .iter()
-            .filter(|c| c.codec.is_audio() | c.codec.is_video())
-            .map(|c| PayloadParams::new(**c))
+            .filter(|(_, c)| c.codec.is_audio() | c.codec.is_video())
+            .map(|(pt, c)| PayloadParams::new(*pt, None, (*c).into()))
             .collect();
 
         for p in &mut params {
             for (pt, values) in fmtps.iter() {
                 // find matching a=fmtp line, if it exists.
-                if **pt == p.codec.pt {
-                    p.fmtps.set_attributes(values);
+                if **pt == p.pt {
+                    for param in values.iter() {
+                        p.spec.format.set_param(param);
+                    }
                 }
 
                 // find resend pt, if there is one.
                 for fp in values.iter() {
                     if let FormatParam::Apt(v) = fp {
-                        if *v == p.codec.pt {
+                        if *v == p.pt {
                             // ensure this is a rtx
                             let is_rtx = rtp_maps
                                 .iter()
-                                .any(|c| c.pt == **pt && c.codec == Codec::Rtx);
+                                .any(|(cpt, c)| cpt == *pt && c.codec == Codec::Rtx);
                             if is_rtx {
                                 p.resend = Some(**pt);
                             }
@@ -326,7 +336,7 @@ impl MediaLine {
 
             // rtcp feedback mechanisms
             for (pt, value) in fbs.iter() {
-                if **pt == p.codec.pt {
+                if **pt == p.pt {
                     match &value[..] {
                         "goog-remb" => {
                             //
@@ -400,8 +410,8 @@ impl MediaLine {
                 .attrs
                 .iter()
                 .filter(|a| {
-                    if let MediaAttribute::RtpMap(c) = a {
-                        c.pt == *m
+                    if let MediaAttribute::RtpMap { pt, value: _ } = a {
+                        pt == m
                     } else {
                         false
                     }
@@ -484,12 +494,12 @@ impl MediaLine {
             .any(|a| matches!(a, MediaAttribute::EndOfCandidates))
     }
 
-    pub fn extmaps(&self) -> Vec<ExtMap> {
+    pub fn extmaps(&self) -> Vec<(u8, Extension)> {
         let mut ret = vec![];
 
         for a in &self.attrs {
-            if let MediaAttribute::ExtMap(e) = a {
-                ret.push(*e);
+            if let MediaAttribute::ExtMap { id, ext } = a {
+                ret.push((*id, *ext));
             }
         }
 
@@ -843,7 +853,10 @@ pub enum MediaAttribute {
     MaxMessageSize(usize),
     // a=extmap:1 urn:ietf:params:rtp-hdrext:ssrc-audio-level
     // a=extmap:2 http://www.webrtc.org/experiments/rtp-hdrext/abs-send-time
-    ExtMap(ExtMap),
+    ExtMap {
+        id: u8, // 1-14 inclusive,
+        ext: Extension,
+    },
     RecvOnly, // a=recvonly
     SendRecv, // a=sendrecv
     SendOnly, // a=sendonly
@@ -857,7 +870,10 @@ pub enum MediaAttribute {
     RtcpRsize,
     Candidate(Candidate),
     EndOfCandidates,
-    RtpMap(CodecSpec),
+    RtpMap {
+        pt: Pt,
+        value: RtpMap,
+    },
     // rtcp-fb RTCP feedback parameters, repeated
     RtcpFb {
         pt: Pt,        // 111
@@ -901,184 +917,6 @@ impl MediaAttribute {
         use MediaAttribute::*;
         matches!(self, RecvOnly | SendRecv | SendOnly | Inactive)
     }
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct CodecSpec {
-    pub pt: Pt,
-    pub codec: Codec,
-    pub clock_rate: u32,
-    pub channels: Option<u8>,
-}
-
-/// Codec specific format parameters.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
-pub struct FormatParams {
-    /// Opus specific parameter.
-    ///
-    /// The minimum duration of media represented by a packet.
-    pub min_p_time: Option<u8>,
-
-    /// Opus specific parameter.
-    ///
-    /// Specifies that the decoder can do Opus in-band FEC
-    pub use_inband_fec: Option<bool>,
-
-    /// Whether h264 sending media encoded at a different level in the offerer-to-answerer
-    /// direction than the level in the answerer-to-offerer direction, is allowed.
-    pub level_asymmetry_allowed: Option<bool>,
-
-    /// What h264 packetization mode is used.
-    ///
-    /// * 0 - single nal.
-    /// * 1 - STAP-A, FU-A is allowed. Non-interleaved.
-    pub packetization_mode: Option<u8>,
-
-    /// H264 profile level.
-    ///
-    /// * 42 00 1f - 4200=baseline (B)              1f=level 3.1
-    /// * 42 e0 1f - 42e0=constrained baseline (CB) 1f=level 3.1
-    /// * 4d 00 1f - 4d00=main (M)                  1f=level 3.1
-    /// * 64 00 1f - 6400=high (H)                  1f=level 3.1
-    pub profile_level_id: Option<u32>,
-
-    /// VP9 profile id.
-    pub profile_id: Option<u32>,
-}
-
-impl FormatParams {
-    fn set_attributes(&mut self, values: &[FormatParam]) {
-        use FormatParam::*;
-        for v in values {
-            match v {
-                MinPTime(v) => self.min_p_time = Some(*v),
-                UseInbandFec(v) => self.use_inband_fec = Some(*v),
-                LevelAsymmetryAllowed(v) => self.level_asymmetry_allowed = Some(*v),
-                PacketizationMode(v) => self.packetization_mode = Some(*v),
-                ProfileLevelId(v) => self.profile_level_id = Some(*v),
-                ProfileId(v) => self.profile_id = Some(*v),
-                Apt(_) => {}
-                Unknown => {}
-            }
-        }
-    }
-
-    fn to_format_param(self) -> Vec<FormatParam> {
-        use FormatParam::*;
-        let mut r = Vec::with_capacity(5);
-
-        if let Some(v) = self.min_p_time {
-            r.push(MinPTime(v));
-        }
-        if let Some(v) = self.use_inband_fec {
-            r.push(UseInbandFec(v));
-        }
-        if let Some(v) = self.level_asymmetry_allowed {
-            r.push(LevelAsymmetryAllowed(v));
-        }
-        if let Some(v) = self.packetization_mode {
-            r.push(PacketizationMode(v));
-        }
-        if let Some(v) = self.profile_level_id {
-            r.push(ProfileLevelId(v));
-        }
-        if let Some(v) = self.profile_id {
-            r.push(ProfileId(v));
-        }
-
-        r
-    }
-}
-
-impl fmt::Display for FormatParams {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        let s = self
-            .to_format_param()
-            .into_iter()
-            .map(|f| f.to_string())
-            .collect::<Vec<_>>()
-            .join(";");
-        write!(f, "{s}")
-    }
-}
-
-/// Known codecs.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-#[non_exhaustive]
-#[allow(missing_docs)]
-pub enum Codec {
-    Opus,
-    H264,
-    // TODO show this when we support h265.
-    #[doc(hidden)]
-    H265,
-    Vp8,
-    Vp9,
-    // TODO show this when we support Av1.
-    #[doc(hidden)]
-    Av1,
-    /// Technically not a codec, but used in places where codecs go
-    /// in `a=rtpmap` lines.
-    #[doc(hidden)]
-    Rtx,
-    #[doc(hidden)]
-    Unknown,
-}
-
-impl Codec {
-    /// Tells if codec is audio.
-    pub fn is_audio(&self) -> bool {
-        use Codec::*;
-        matches!(self, Opus)
-    }
-
-    /// Tells if codec is video.
-    pub fn is_video(&self) -> bool {
-        use Codec::*;
-        matches!(self, H264 | Vp8 | Vp9 | Av1)
-    }
-}
-
-impl<'a> From<&'a str> for Codec {
-    fn from(v: &'a str) -> Self {
-        let lc = v.to_ascii_lowercase();
-        match &lc[..] {
-            "opus" => Codec::Opus,
-            "h264" => Codec::H264,
-            "h265" => Codec::H265,
-            "vp8" => Codec::Vp8,
-            "vp9" => Codec::Vp9,
-            "av1" => Codec::Av1,
-            "rtx" => Codec::Rtx, // resends
-            _ => Codec::Unknown,
-        }
-    }
-}
-
-impl fmt::Display for Codec {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Codec::Opus => write!(f, "opus"),
-            Codec::H264 => write!(f, "H264"),
-            Codec::H265 => write!(f, "H265"),
-            Codec::Vp8 => write!(f, "VP8"),
-            Codec::Vp9 => write!(f, "VP9"),
-            Codec::Av1 => write!(f, "AV1"),
-            Codec::Rtx => write!(f, "rtx"),
-            Codec::Unknown => write!(f, "unknown"),
-        }
-    }
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct PayloadParams {
-    pub codec: CodecSpec,
-    pub fmtps: FormatParams,
-    pub resend: Option<Pt>,
-    pub fb_transport_cc: bool,
-    pub fb_fir: bool,
-    pub fb_nack: bool,
-    pub fb_pli: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1189,65 +1027,86 @@ impl fmt::Display for FormatParam {
 }
 
 impl PayloadParams {
-    fn new(codec: CodecSpec) -> Self {
-        PayloadParams {
-            codec,
-            fmtps: FormatParams::default(),
-            resend: None,
-            fb_transport_cc: false,
-            fb_fir: false,
-            fb_nack: false,
-            fb_pli: false,
-        }
-    }
-
-    pub fn as_media_attrs(&self, attrs: &mut Vec<MediaAttribute>) {
-        attrs.push(MediaAttribute::RtpMap(self.codec));
+    pub(crate) fn as_media_attrs(&self, attrs: &mut Vec<MediaAttribute>) {
+        attrs.push(MediaAttribute::RtpMap {
+            pt: self.pt,
+            value: self.spec.into(),
+        });
 
         if self.fb_transport_cc {
             attrs.push(MediaAttribute::RtcpFb {
-                pt: self.codec.pt,
+                pt: self.pt,
                 value: "transport-cc".into(),
             });
         }
         if self.fb_fir {
             attrs.push(MediaAttribute::RtcpFb {
-                pt: self.codec.pt,
+                pt: self.pt,
                 value: "ccm fir".into(),
             });
         }
         if self.fb_nack {
             attrs.push(MediaAttribute::RtcpFb {
-                pt: self.codec.pt,
+                pt: self.pt,
                 value: "nack".into(),
             });
         }
         if self.fb_pli {
             attrs.push(MediaAttribute::RtcpFb {
-                pt: self.codec.pt,
+                pt: self.pt,
                 value: "nack pli".into(),
             });
         }
 
-        let fmtps = self.fmtps.to_format_param();
+        let fmtps = self.spec.format.to_format_param();
         if !fmtps.is_empty() {
             attrs.push(MediaAttribute::Fmtp {
-                pt: self.codec.pt,
+                pt: self.pt,
                 values: fmtps,
             });
         }
 
         if let Some(pt) = self.resend {
-            attrs.push(MediaAttribute::RtpMap(CodecSpec {
+            attrs.push(MediaAttribute::RtpMap {
                 pt,
-                codec: Codec::Rtx,
-                clock_rate: self.codec.clock_rate,
-                channels: None,
-            }));
+                value: RtpMap {
+                    codec: Codec::Rtx,
+                    clock_rate: self.spec.clock_rate,
+                    channels: None,
+                },
+            });
             attrs.push(MediaAttribute::Fmtp {
                 pt,
-                values: vec![FormatParam::Apt(self.codec.pt)],
+                values: vec![FormatParam::Apt(self.pt)],
             });
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RtpMap {
+    pub codec: Codec,
+    pub clock_rate: u32,
+    pub channels: Option<u8>,
+}
+
+impl From<RtpMap> for CodecSpec {
+    fn from(v: RtpMap) -> Self {
+        CodecSpec {
+            codec: v.codec,
+            clock_rate: v.clock_rate,
+            channels: v.channels,
+            format: FormatParams::default(),
+        }
+    }
+}
+
+impl From<CodecSpec> for RtpMap {
+    fn from(v: CodecSpec) -> Self {
+        RtpMap {
+            codec: v.codec,
+            clock_rate: v.clock_rate,
+            channels: v.channels,
         }
     }
 }
@@ -1256,7 +1115,7 @@ impl PayloadParams {
 pub struct Simulcast {
     pub send: SimulcastGroups,
     pub recv: SimulcastGroups,
-    /// If this is created synthentically for a munged SDP.
+    /// If this is created synthetically for a munged SDP.
     pub is_munged: bool,
 }
 
@@ -1378,6 +1237,17 @@ impl fmt::Display for SessionAttribute {
                 let mids: Vec<_> = mids.iter().map(|m| m.to_string()).collect();
                 write!(f, "a=group:{} {}\r\n", typ, mids.join(" "))?;
             }
+            MsidSemantic {
+                semantic,
+                stream_ids,
+            } => {
+                write!(
+                    f,
+                    "a=msid-semantic: {} {}\r\n",
+                    semantic,
+                    stream_ids.join(" ")
+                )?;
+            }
             IceLite => write!(f, "a=ice-lite\r\n")?,
             IceUfrag(v) => write!(f, "a=ice-ufrag:{v}\r\n")?,
             IcePwd(v) => write!(f, "a=ice-pwd:{v}\r\n")?,
@@ -1463,15 +1333,15 @@ impl fmt::Display for MediaAttribute {
             Mid(v) => write!(f, "a=mid:{v}\r\n")?,
             SctpPort(v) => write!(f, "a=sctp-port:{v}\r\n")?,
             MaxMessageSize(v) => write!(f, "a=max-message-size:{v}\r\n")?,
-            ExtMap(e) => {
-                if !e.ext.is_serialized() {
+            ExtMap { id, ext } => {
+                if !ext.is_serialized() {
                     return Ok(());
                 }
-                write!(f, "a=extmap:{}", e.id)?;
-                if let Some(d) = &e.direction {
-                    write!(f, "/{d}")?;
-                }
-                write!(f, " {}", e.ext.as_uri())?;
+                write!(f, "a=extmap:{}", id)?;
+                // if let Some(d) = &e.direction {
+                //     write!(f, "/{d}")?;
+                // }
+                write!(f, " {}", ext.as_uri())?;
                 // if let Some(e) = &e.ext {
                 //     write!(f, " {}", e)?;
                 // }
@@ -1489,8 +1359,8 @@ impl fmt::Display for MediaAttribute {
             RtcpRsize => write!(f, "a=rtcp-rsize\r\n")?,
             Candidate(c) => write!(f, "{c}")?,
             EndOfCandidates => write!(f, "a=end-of-candidates\r\n")?,
-            RtpMap(c) => {
-                write!(f, "a=rtpmap:{} {}/{}", c.pt, c.codec, c.clock_rate)?;
+            RtpMap { pt, value: c } => {
+                write!(f, "a=rtpmap:{} {}/{}", pt, c.codec, c.clock_rate)?;
                 if let Some(e) = c.channels {
                     write!(f, "/{e}")?;
                 }
@@ -1553,7 +1423,7 @@ impl fmt::Display for MediaAttribute {
                     "Empty a=simulcast"
                 );
                 if *is_munged {
-                    // dont' write
+                    // don't write
                     return Ok(());
                 }
                 write!(f, "a=simulcast:")?;
@@ -1649,16 +1519,40 @@ mod test {
 
     #[test]
     fn write_sdp() {
-        let sdp = Sdp { session: Session { id: 5_058_682_828_002_148_772.into(),
-            bw: None, attrs:
-            vec![SessionAttribute::Group { typ: "BUNDLE".into(), mids: vec!["0".into()] }, SessionAttribute::Unused("msid-semantic: WMS 5UUdwiuY7OML2EkQtF38pJtNP5v7In1LhjEK".into())] },
-            media_lines: vec![
-                MediaLine {
-                    typ: MediaType::Audio,
-                    proto: Proto::Srtp,
-                    pts: vec![111.into(), 103.into(), 104.into(), 9.into(), 0.into(), 8.into(), 106.into(), 105.into(), 13.into(), 110.into(), 112.into(), 113.into(), 126.into()],
-                    bw: None,
-                    attrs: vec![
+        let sdp = Sdp {
+            session: Session {
+                id: 5_058_682_828_002_148_772.into(),
+                bw: None,
+                attrs: vec![
+                    SessionAttribute::Group {
+                        typ: "BUNDLE".into(),
+                        mids: vec!["0".into()],
+                    },
+                    SessionAttribute::Unused(
+                        "msid-semantic: WMS 5UUdwiuY7OML2EkQtF38pJtNP5v7In1LhjEK".into(),
+                    ),
+                ],
+            },
+            media_lines: vec![MediaLine {
+                typ: MediaType::Audio,
+                proto: Proto::Srtp,
+                pts: vec![
+                    111.into(),
+                    103.into(),
+                    104.into(),
+                    9.into(),
+                    0.into(),
+                    8.into(),
+                    106.into(),
+                    105.into(),
+                    13.into(),
+                    110.into(),
+                    112.into(),
+                    113.into(),
+                    126.into(),
+                ],
+                bw: None,
+                attrs: vec![
                         MediaAttribute::Rtcp("9 IN IP4 0.0.0.0".into()),
                         MediaAttribute::IceUfrag("S5hk".into()),
                         MediaAttribute::IcePwd("0zV/Yu3y8aDzbHgqWhnVQhqP".into()),
@@ -1666,22 +1560,24 @@ mod test {
                         MediaAttribute::Fingerprint(Fingerprint { hash_func: "sha-256".into(), bytes: vec![140, 100, 237, 3, 118, 208, 61, 180, 136, 8, 145, 100, 8, 128, 168, 198, 90, 191, 139, 78, 56, 39, 150, 202, 8, 73, 37, 115, 70, 96, 32, 220] }),
                         MediaAttribute::Setup(Setup::ActPass),
                         MediaAttribute::Mid("0".into()),
-                        MediaAttribute::ExtMap(ExtMap { id: 1, direction: None, ext: Extension::AudioLevel }),
-                        MediaAttribute::ExtMap(ExtMap { id: 2, direction: None, ext: Extension::AbsoluteSendTime }),
-                        MediaAttribute::ExtMap(ExtMap { id: 3, direction: None, ext: Extension::TransportSequenceNumber }),
-                        MediaAttribute::ExtMap(ExtMap { id: 4, direction: None, ext: Extension::RtpMid }),
-                        MediaAttribute::ExtMap(ExtMap { id: 5, direction: None, ext: Extension::RtpStreamId }),
-                        MediaAttribute::ExtMap(ExtMap { id: 6, direction: None, ext: Extension::RepairedRtpStreamId }),
+                        MediaAttribute::ExtMap{ id: 1, ext: Extension::AudioLevel },
+                        MediaAttribute::ExtMap{ id: 2, ext: Extension::AbsoluteSendTime },
+                        MediaAttribute::ExtMap{ id: 3, ext: Extension::TransportSequenceNumber },
+                        MediaAttribute::ExtMap{ id: 4, ext: Extension::RtpMid },
+                        MediaAttribute::ExtMap{ id: 5, ext: Extension::RtpStreamId },
+                        MediaAttribute::ExtMap{ id: 6, ext: Extension::RepairedRtpStreamId },
                         MediaAttribute::SendRecv,
                         MediaAttribute::Msid(Msid { stream_id: "5UUdwiuY7OML2EkQtF38pJtNP5v7In1LhjEK".into(), track_id: "f78dde68-7055-4e20-bb37-433803dd1ed1".into() }),
                         MediaAttribute::RtcpMux,
-                        MediaAttribute::RtpMap( CodecSpec { pt: 111.into(), codec: "opus".into(), clock_rate: 48_000, channels: Some(2) }),
+                        MediaAttribute::RtpMap { pt: 111.into(), value: RtpMap {  codec: "opus".into(), clock_rate: 48_000, channels: Some(2) }},
                         MediaAttribute::RtcpFb { pt: 111.into(), value: "transport-cc".into() },
                         MediaAttribute::Fmtp { pt: 111.into(), values: vec![FormatParam::MinPTime(10), FormatParam::UseInbandFec(true)] },
                         MediaAttribute::Ssrc { ssrc: 3_948_621_874.into(), attr: "cname".into(), value: "xeXs3aE9AOBn00yJ".into() },
                         MediaAttribute::Ssrc { ssrc: 3_948_621_874.into(), attr: "msid".into(), value: "5UUdwiuY7OML2EkQtF38pJtNP5v7In1LhjEK f78dde68-7055-4e20-bb37-433803dd1ed1".into() },
                         MediaAttribute::Ssrc { ssrc: 3_948_621_874.into(), attr: "mslabel".into(), value: "5UUdwiuY7OML2EkQtF38pJtNP5v7In1LhjEK".into() },
-                        MediaAttribute::Ssrc { ssrc: 3_948_621_874.into(), attr: "label".into(), value: "f78dde68-7055-4e20-bb37-433803dd1ed1".into() }] }] };
+                        MediaAttribute::Ssrc { ssrc: 3_948_621_874.into(), attr: "label".into(), value: "f78dde68-7055-4e20-bb37-433803dd1ed1".into() }],
+            }],
+        };
         assert_eq!(&format!("{sdp}"), "v=0\r\n\
             o=- 5058682828002148772 2 IN IP4 0.0.0.0\r\n\
             s=-\r\n\

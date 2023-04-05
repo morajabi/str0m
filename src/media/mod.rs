@@ -2,17 +2,14 @@
 
 use std::time::Instant;
 
+use crate::format::PayloadParams;
 pub use crate::rtp::VideoOrientation;
 pub use crate::rtp::{Direction, ExtensionValues, MediaTime, Mid, Pt, Rid};
-pub use crate::sdp::{Codec, FormatParams};
 
 use crate::{Input, Rtc, RtcError};
 
 mod event;
 pub use event::*;
-
-mod codec;
-pub use codec::{CodecConfig, PayloadParams};
 
 mod receiver;
 
@@ -26,8 +23,7 @@ pub(crate) use inner::{MediaInner, Source};
 /// Half internal structures regarding RTP level.
 pub mod rtp {
     pub use crate::packet::RtpMeta;
-    pub use crate::packet::{CodecExtra, Vp8CodecExtra};
-    pub use crate::rtp::{ExtensionValues, RtpHeader, SeqNo, Ssrc};
+    pub use crate::rtp::{Extension, ExtensionMap, ExtensionValues, RtpHeader, SeqNo, Ssrc};
 }
 
 /// Audio or video media.
@@ -42,7 +38,7 @@ pub mod rtp {
 ///
 /// let mut rtc = Rtc::new();
 ///
-/// // add candidates, do SDP negotation
+/// // add candidates, do SDP negotiation
 /// let mid: Mid = todo!(); // obtain mid from Event::MediaAdded.
 ///
 /// let media = rtc.media(mid).unwrap();
@@ -126,11 +122,12 @@ impl Media<'_> {
     ///
     /// ```no_run
     /// # use str0m::Rtc;
-    /// # use str0m::media::{PayloadParams, MediaData, Mid};
+    /// # use str0m::media::{MediaData, Mid};
+    /// # use str0m::format::PayloadParams;
     /// # use std::time::Instant;
     /// let mut rtc = Rtc::new();
     ///
-    /// // add candidates, do SDP negotation
+    /// // add candidates, do SDP negotiation
     /// let mid: Mid = todo!(); // obtain mid from Event::MediaAdded.
     ///
     /// let media = rtc.media(mid).unwrap();
@@ -190,7 +187,7 @@ impl Media<'_> {
     /// # use str0m::media::{Mid, KeyframeRequestKind};
     /// let mut rtc = Rtc::new();
     ///
-    /// // add candidates, do SDP negotation
+    /// // add candidates, do SDP negotiation
     /// let mid: Mid = todo!(); // obtain mid from Event::MediaAdded.
     ///
     /// let media = rtc.media(mid).unwrap();
@@ -217,11 +214,12 @@ impl Media<'_> {
 ///
 /// ```no_run
 /// # use str0m::Rtc;
-/// # use str0m::media::{PayloadParams, MediaData, Mid};
+/// # use str0m::media::{MediaData, Mid};
+/// # use str0m::format::PayloadParams;
 /// # use std::time::Instant;
 /// let mut rtc = Rtc::new();
 ///
-/// // add candidates, do SDP negotation
+/// // add candidates, do SDP negotiation
 /// let mid: Mid = todo!(); // obtain mid from Event::MediaAdded.
 ///
 /// let media = rtc.media(mid).unwrap();

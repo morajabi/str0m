@@ -2,14 +2,14 @@ use std::collections::{HashMap, HashSet, VecDeque};
 use std::time::{Duration, Instant};
 
 use crate::change::AddMedia;
+use crate::format::Codec;
 pub use crate::packet::RtpMeta;
 pub use crate::rtp::{Direction, ExtensionValues, MediaTime, Mid, Pt, Rid, Ssrc};
-pub use crate::sdp::{Codec, FormatParams};
 
 use crate::io::{Id, DATAGRAM_MTU};
 use crate::packet::{DepacketizingBuffer, MediaKind, Packetized, QueueSnapshot};
 use crate::packet::{PacketizedMeta, PacketizingBuffer, QueueState};
-use crate::rtp::{Extensions, Fir, FirEntry, NackEntry, Pli, Rtcp};
+use crate::rtp::{ExtensionMap, Fir, FirEntry, NackEntry, Pli, Rtcp};
 use crate::rtp::{RtcpFb, RtpHeader, SdesType};
 use crate::rtp::{SeqNo, MAX_PADDING_PACKET_SIZE, SRTP_BLOCK_SIZE, SRTP_OVERHEAD};
 use crate::sdp::{MediaLine, Msid, Simulcast as SdpSimulcast};
@@ -79,7 +79,7 @@ pub(crate) struct MediaInner {
     kind: MediaKind,
 
     /// The extensions for this media.
-    exts: Extensions,
+    exts: ExtensionMap,
 
     /// Current media direction.
     ///
@@ -206,14 +206,14 @@ impl MediaInner {
         self.kind
     }
 
-    pub fn set_exts(&mut self, exts: Extensions) {
+    pub fn set_exts(&mut self, exts: ExtensionMap) {
         if self.exts != exts {
             info!("Set {:?} extensions: {:?}", self.mid, exts);
             self.exts = exts;
         }
     }
 
-    pub fn exts(&self) -> &Extensions {
+    pub fn exts(&self) -> &ExtensionMap {
         &self.exts
     }
 
@@ -230,11 +230,8 @@ impl MediaInner {
     }
 
     pub fn match_params(&self, params: PayloadParams) -> Option<Pt> {
-        let c = self
-            .params
-            .iter()
-            .max_by_key(|p| p.match_score(params.inner()))?;
-        c.match_score(params.inner())?; // avoid None, which isn't a match.
+        let c = self.params.iter().max_by_key(|p| p.match_score(&params))?;
+        c.match_score(&params)?; // avoid None, which isn't a match.
         Some(c.pt())
     }
 
@@ -254,11 +251,8 @@ impl MediaInner {
             return Err(RtcError::NotSendingDirection(self.dir));
         }
 
-        let codec = { self.codec_by_pt(pt).map(|p| p.codec()) };
-
-        let codec = match codec {
-            Some(v) => v,
-            None => return Err(RtcError::UnknownPt(pt)),
+        let Some(spec) = self.codec_by_pt(pt).map(|p| p.spec()) else {
+            return Err(RtcError::UnknownPt(pt));
         };
 
         // The SSRC is figured out given the simulcast level.
@@ -268,8 +262,8 @@ impl MediaInner {
         tx.update_clocks(rtp_time, wallclock);
 
         let buf = self.buffers_tx.entry(pt).or_insert_with(|| {
-            let max_retain = if codec.is_audio() { 4096 } else { 2048 };
-            PacketizingBuffer::new(codec.into(), max_retain)
+            let max_retain = if spec.codec.is_audio() { 4096 } else { 2048 };
+            PacketizingBuffer::new(spec.codec.into(), max_retain)
         });
 
         trace!(
@@ -305,8 +299,8 @@ impl MediaInner {
         // We might want to make this check more fine grained by testing which PT is
         // in "active use" right now.
         self.params.iter().any(|r| match kind {
-            KeyframeRequestKind::Pli => r.inner().fb_pli,
-            KeyframeRequestKind::Fir => r.inner().fb_fir,
+            KeyframeRequestKind::Pli => r.fb_pli,
+            KeyframeRequestKind::Fir => r.fb_fir,
         })
     }
 
@@ -343,7 +337,7 @@ impl MediaInner {
     pub fn poll_packet(
         &mut self,
         now: Instant,
-        exts: &Extensions,
+        exts: &ExtensionMap,
         twcc: &mut u64,
         pad_size: Option<usize>,
         buf: &mut Vec<u8>,
@@ -467,7 +461,7 @@ impl MediaInner {
 
             // If there is no buffer for this resend, we return None. This is
             // a weird situation though, since it means the other side sent a nack for
-            // an SSRC that matched this Media, but didnt match a buffer_tx.
+            // an SSRC that matched this Media, but didn't match a buffer_tx.
             let buffer = self.buffers_tx.values().find(|p| p.has_ssrc(resend.ssrc))?;
 
             let pkt = buffer.get(resend.seq_no);
@@ -713,7 +707,7 @@ impl MediaInner {
     pub fn get_params(&self, pt: Pt) -> Option<&PayloadParams> {
         self.params
             .iter()
-            .find(|p| p.inner().codec.pt == pt || p.inner().resend == Some(pt))
+            .find(|p| p.pt() == pt || p.resend == Some(pt))
     }
 
     pub fn has_nack(&mut self) -> bool {
@@ -845,7 +839,7 @@ impl MediaInner {
         }
     }
 
-    /// Appply incoming RTCP feedback.
+    /// Apply incoming RTCP feedback.
     pub fn handle_rtcp_fb(&mut self, now: Instant, fb: RtcpFb) -> Option<()> {
         debug!("Handle RTCP feedback: {:?}", fb);
 
@@ -889,7 +883,7 @@ impl MediaInner {
                 source_rx.set_dlrr_item(now, v);
             }
             Goodbye(_v) => {
-                // For some reason, Chrome sends a Goodbye on every SDP negotation for all active
+                // For some reason, Chrome sends a Goodbye on every SDP negotiation for all active
                 // m-lines. Seems strange, but lets not reset any state.
                 // self.sources_rx.retain(|s| {
                 //     let remove = s.ssrc() == v || s.repairs() == Some(v);
@@ -1152,7 +1146,7 @@ impl MediaInner {
 
 // returns the corresponding rtx pt counterpart, if any
 fn pt_rtx(params: &[PayloadParams], pt: Pt) -> Option<Pt> {
-    params.iter().find(|p| p.pt() == pt)?.pt_rtx()
+    params.iter().find(|p| p.pt() == pt)?.resend
 }
 
 impl<'a> NextPacketBody<'a> {
@@ -1177,8 +1171,8 @@ impl<'a> NextPacketBody<'a> {
     fn marker(&self) -> bool {
         use NextPacketBody::*;
         match self {
-            Regular { pkt } => pkt.last,
-            Resend { pkt, .. } => pkt.last,
+            Regular { pkt } => pkt.marker,
+            Resend { pkt, .. } => pkt.marker,
             Padding { .. } => false,
         }
     }
@@ -1237,7 +1231,7 @@ impl Default for MediaInner {
                 track_id: Id::<30>::random().to_string(),
             },
             kind: MediaKind::Video,
-            exts: Extensions::new(),
+            exts: ExtensionMap::empty(),
             dir: Direction::SendRecv,
             params: vec![],
             sources_rx: vec![],
@@ -1262,7 +1256,7 @@ impl Default for MediaInner {
 }
 
 impl MediaInner {
-    pub fn from_remote_media_line(l: &MediaLine, index: usize, exts: Extensions) -> Self {
+    pub fn from_remote_media_line(l: &MediaLine, index: usize, exts: ExtensionMap) -> Self {
         MediaInner {
             mid: l.mid(),
             index,
@@ -1272,14 +1266,14 @@ impl MediaInner {
             kind: l.typ.clone().into(),
             exts,
             dir: l.direction().invert(), // remote direction is reverse.
-            params: l.rtp_params().into_iter().map(PayloadParams::new).collect(),
+            params: l.rtp_params(),
             ..Default::default()
         }
     }
 
     // Going from AddMedia to Media for pending in a Change and are sent
     // in the offer to the other side.
-    pub fn from_add_media(a: AddMedia, exts: Extensions) -> Self {
+    pub fn from_add_media(a: AddMedia, exts: ExtensionMap) -> Self {
         let mut media = MediaInner {
             mid: a.mid,
             index: a.index,

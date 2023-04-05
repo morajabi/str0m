@@ -3,16 +3,16 @@
 use std::fmt;
 use std::ops::{Deref, DerefMut};
 
-use sctp_proto::ReliabilityType;
-
 use crate::channel::ChannelId;
 use crate::dtls::Fingerprint;
+use crate::format::CodecConfig;
+use crate::format::PayloadParams;
 use crate::ice::{Candidate, IceCreds};
 use crate::io::Id;
 use crate::media::MediaInner;
-use crate::media::{CodecConfig, MediaKind, PayloadParams, Source};
-use crate::rtp::{Direction, Extension, Extensions, Mid, Pt, Ssrc};
-use crate::sctp::DcepOpen;
+use crate::media::{MediaKind, Source};
+use crate::rtp::{Direction, Extension, ExtensionMap, Mid, Pt, Ssrc};
+use crate::sctp::ChannelConfig;
 use crate::sdp::{self, MediaAttribute, MediaLine, MediaType, Msid, Sdp};
 use crate::sdp::{Proto, SessionAttribute, Setup};
 use crate::sdp::{SimulcastGroups, SimulcastOption};
@@ -92,7 +92,9 @@ impl<'a> SdpApi<'a> {
 
         // Handle potentially new m=application line.
         let client = self.rtc.dtls.is_active().expect("DTLS active to be set");
-        self.rtc.init_sctp(client);
+        if self.rtc.session.app().is_some() {
+            self.rtc.init_sctp(client);
+        }
 
         let params = AsSdpParams::new(self.rtc, None);
         let sdp = as_sdp(&self.rtc.session, params);
@@ -113,7 +115,7 @@ impl<'a> SdpApi<'a> {
     /// let mut rtc = Rtc::new();
     ///
     /// let mut changes = rtc.sdp_api();
-    /// let mid = changes.add_media(MediaKind::Audio, Direction::SendOnly, None);
+    /// let mid = changes.add_media(MediaKind::Audio, Direction::SendOnly, None, None);
     /// let (offer, pending) = changes.apply().unwrap();
     ///
     /// // send offer to remote peer, receive answer back
@@ -155,10 +157,12 @@ impl<'a> SdpApi<'a> {
 
         // Handle potentially new m=application line.
         let client = self.rtc.dtls.is_active().expect("DTLS to be inited");
-        self.rtc.init_sctp(client);
+        if self.rtc.session.app().is_some() {
+            self.rtc.init_sctp(client);
+        }
 
-        for (id, dcep) in new_channels {
-            self.rtc.sctp.open_stream(*id, dcep);
+        for (id, config) in new_channels {
+            self.rtc.chan.confirm(id, config);
         }
 
         Ok(())
@@ -175,7 +179,7 @@ impl<'a> SdpApi<'a> {
     /// let mut changes = rtc.sdp_api();
     /// assert!(!changes.has_changes());
     ///
-    /// let mid = changes.add_media(MediaKind::Audio, Direction::SendRecv, None);
+    /// let mid = changes.add_media(MediaKind::Audio, Direction::SendRecv, None, None);
     /// assert!(changes.has_changes());
     /// ```
     pub fn has_changes(&self) -> bool {
@@ -189,33 +193,50 @@ impl<'a> SdpApi<'a> {
     /// The mid is not valid to use until the SDP offer-answer dance is complete and
     /// the mid been advertised via [`Event::MediaAdded`][crate::Event::MediaAdded].
     ///
+    /// * `stream_id` is used to synchronize media. It is `a=msid-semantic: WMS <streamId>` line in SDP.
+    /// * `track_id` is becomes both the track id in `a=msid <streamId> <trackId>` as well as the
+    ///   CNAME in the RTP SDES.
+    ///
     /// ```
     /// # use str0m::{Rtc, media::MediaKind, media::Direction};
     /// let mut rtc = Rtc::new();
     ///
     /// let mut changes = rtc.sdp_api();
     ///
-    /// let mid = changes.add_media(MediaKind::Audio, Direction::SendRecv, None);
+    /// let mid = changes.add_media(MediaKind::Audio, Direction::SendRecv, None, None);
     /// ```
-    pub fn add_media(&mut self, kind: MediaKind, dir: Direction, cname: Option<String>) -> Mid {
+    pub fn add_media(
+        &mut self,
+        kind: MediaKind,
+        dir: Direction,
+        stream_id: Option<String>,
+        track_id: Option<String>,
+    ) -> Mid {
         let mid = self.rtc.new_mid();
 
-        let cname = if let Some(cname) = cname {
-            fn is_token_char(c: &char) -> bool {
-                // token-char = %x21 / %x23-27 / %x2A-2B / %x2D-2E / %x30-39
-                // / %x41-5A / %x5E-7E
-                let u = *c as u32;
-                u == 0x21
-                    || (0x23..=0x27).contains(&u)
-                    || (0x2a..=0x2b).contains(&u)
-                    || (0x2d..=0x2e).contains(&u)
-                    || (0x30..=0x39).contains(&u)
-                    || (0x41..=0x5a).contains(&u)
-                    || (0x5e..0x7e).contains(&u)
-            }
-            // https://www.rfc-editor.org/rfc/rfc8830
-            // msid-id = 1*64token-char
-            cname.chars().filter(is_token_char).take(64).collect()
+        // https://www.rfc-editor.org/rfc/rfc8830
+        // msid-id = 1*64token-char
+        fn is_token_char(c: &char) -> bool {
+            // token-char = %x21 / %x23-27 / %x2A-2B / %x2D-2E / %x30-39
+            // / %x41-5A / %x5E-7E
+            let u = *c as u32;
+            u == 0x21
+                || (0x23..=0x27).contains(&u)
+                || (0x2a..=0x2b).contains(&u)
+                || (0x2d..=0x2e).contains(&u)
+                || (0x30..=0x39).contains(&u)
+                || (0x41..=0x5a).contains(&u)
+                || (0x5e..0x7e).contains(&u)
+        }
+
+        let stream_id = if let Some(stream_id) = stream_id {
+            stream_id.chars().filter(is_token_char).take(64).collect()
+        } else {
+            Id::<20>::random().to_string()
+        };
+
+        let track_id = if let Some(track_id) = track_id {
+            track_id.chars().filter(is_token_char).take(64).collect()
         } else {
             Id::<20>::random().to_string()
         };
@@ -247,13 +268,13 @@ impl<'a> SdpApi<'a> {
 
         // TODO: let user configure stream/track name.
         let msid = Msid {
-            stream_id: cname.clone(),
-            track_id: Id::<30>::random().to_string(),
+            stream_id,
+            track_id: track_id.clone(),
         };
 
         let add = AddMedia {
             mid,
-            cname,
+            cname: track_id,
             msid,
             kind,
             dir,
@@ -319,18 +340,14 @@ impl<'a> SdpApi<'a> {
             self.changes.0.push(Change::AddApp(mid));
         }
 
-        let id = self.rtc.new_sctp_channel();
-
-        let dcep = DcepOpen {
-            unordered: false,
-            channel_type: ReliabilityType::Reliable,
-            reliability_parameter: 0,
+        let config = ChannelConfig {
             label,
-            priority: 0,
-            protocol: String::new(),
+            ..Default::default()
         };
 
-        self.changes.0.push(Change::AddChannel(id, dcep));
+        let id = self.rtc.chan.new_channel(&config);
+
+        self.changes.0.push(Change::AddChannel((id, config)));
 
         id
     }
@@ -387,7 +404,7 @@ impl<'a> SdpApi<'a> {
 /// let mut rtc = Rtc::new();
 ///
 /// let mut changes = rtc.sdp_api();
-/// let mid = changes.add_media(MediaKind::Audio, Direction::SendOnly, None);
+/// let mid = changes.add_media(MediaKind::Audio, Direction::SendOnly, None, None);
 /// let (offer, pending) = changes.apply().unwrap();
 ///
 /// // send offer to remote peer, receive answer back
@@ -407,7 +424,7 @@ pub(crate) struct Changes(pub Vec<Change>);
 pub(crate) enum Change {
     AddMedia(AddMedia),
     AddApp(Mid),
-    AddChannel(ChannelId, DcepOpen),
+    AddChannel((ChannelId, ChannelConfig)),
     Direction(Mid, Direction),
 }
 
@@ -443,7 +460,7 @@ fn requires_negotiation(c: &Change) -> bool {
     match c {
         Change::AddMedia(_) => true,
         Change::AddApp(_) => true,
-        Change::AddChannel(_, _) => false,
+        Change::AddChannel(_) => false,
         Change::Direction(_, _) => true,
     }
 }
@@ -452,8 +469,8 @@ fn apply_direct_changes(rtc: &mut Rtc, mut changes: Changes) {
     // Split out new channels, since that is not handled by the Session.
     let new_channels = changes.take_new_channels();
 
-    for (id, dcep) in new_channels {
-        rtc.sctp.open_stream(*id, dcep);
+    for (id, config) in new_channels {
+        rtc.chan.confirm(id, config);
     }
 }
 
@@ -504,7 +521,7 @@ fn init_dtls(rtc: &mut Rtc, remote_sdp: &Sdp) -> Result<(), RtcError> {
 }
 
 fn as_sdp(session: &Session, params: AsSdpParams) -> Sdp {
-    let (media_lines, mids) = {
+    let (media_lines, mids, stream_ids) = {
         let mut v = as_media_lines(session);
 
         let mut new_lines = vec![];
@@ -543,7 +560,14 @@ fn as_sdp(session: &Session, params: AsSdpParams) -> Sdp {
         // Mids go into the session part of the SDP.
         let mids = v.iter().map(|m| m.mid()).collect();
 
-        (lines, mids)
+        let mut stream_ids = vec![];
+        for msid in v.iter().filter_map(|v| v.msid()) {
+            if !stream_ids.contains(&msid.stream_id) {
+                stream_ids.push(msid.stream_id.clone());
+            }
+        }
+
+        (lines, mids, stream_ids)
     };
 
     let mut attrs = vec![
@@ -551,7 +575,10 @@ fn as_sdp(session: &Session, params: AsSdpParams) -> Sdp {
             typ: "BUNDLE".into(),
             mids,
         },
-        // a=msid-semantic: WMS
+        SessionAttribute::MsidSemantic {
+            semantic: "WMS".to_string(),
+            stream_ids,
+        },
     ];
 
     if session.ice_lite {
@@ -730,8 +757,8 @@ fn update_session(session: &mut Session, sdp: &Sdp) {
 
     let extmaps = sdp.media_lines.iter().flat_map(|m| m.extmaps());
 
-    for x in extmaps {
-        session.exts.apply_mapping(&x);
+    for (id, ext) in extmaps {
+        session.exts.apply(id, ext);
     }
 
     if old != session.exts {
@@ -774,7 +801,7 @@ fn update_media(
     media: &mut MediaInner,
     m: &MediaLine,
     config: &CodecConfig,
-    session_exts: &Extensions,
+    session_exts: &ExtensionMap,
 ) {
     // Nack enabled for any payload
     let nack_enabled = m.rtp_params().iter().any(|p| p.fb_nack);
@@ -794,16 +821,15 @@ fn update_media(
     let params: Vec<Pt> = m
         .rtp_params()
         .into_iter()
-        .map(PayloadParams::new)
         .filter(|p| config.matches(p))
         .map(|p| p.pt())
         .collect();
     media.retain_pts(&params);
 
     // Narrowing of Rtp header extension mappings.
-    let mut exts = Extensions::new();
-    for x in m.extmaps() {
-        exts.set_mapping(x);
+    let mut exts = ExtensionMap::empty();
+    for (id, ext) in m.extmaps() {
+        exts.set(id, ext);
     }
     exts.keep_same(session_exts);
     media.set_exts(exts);
@@ -835,6 +861,7 @@ fn update_media(
 
 trait AsSdpMediaLine {
     fn mid(&self) -> Mid;
+    fn msid(&self) -> Option<&Msid>;
     fn index(&self) -> usize;
     fn as_media_line(&self, attrs: Vec<MediaAttribute>) -> MediaLine;
 }
@@ -842,6 +869,9 @@ trait AsSdpMediaLine {
 impl AsSdpMediaLine for (Mid, usize) {
     fn mid(&self) -> Mid {
         self.0
+    }
+    fn msid(&self) -> Option<&Msid> {
+        None
     }
     fn index(&self) -> usize {
         self.1
@@ -865,6 +895,9 @@ impl AsSdpMediaLine for MediaInner {
     fn mid(&self) -> Mid {
         MediaInner::mid(self)
     }
+    fn msid(&self) -> Option<&Msid> {
+        Some(MediaInner::msid(self))
+    }
     fn index(&self) -> usize {
         MediaInner::index(self)
     }
@@ -877,8 +910,8 @@ impl AsSdpMediaLine for MediaInner {
         attrs.push(MediaAttribute::Mid(self.mid()));
 
         let audio = self.kind() == MediaKind::Audio;
-        for e in self.exts().as_extmap(audio) {
-            attrs.push(MediaAttribute::ExtMap(e));
+        for (id, ext) in self.exts().iter(audio) {
+            attrs.push(MediaAttribute::ExtMap { id, ext });
         }
 
         attrs.push(self.direction().into());
@@ -886,14 +919,14 @@ impl AsSdpMediaLine for MediaInner {
         attrs.push(MediaAttribute::RtcpMux);
 
         for p in self.payload_params() {
-            p.inner().as_media_attrs(&mut attrs);
+            p.as_media_attrs(&mut attrs);
         }
 
         // The advertised payload types.
         let pts = self
             .payload_params()
             .iter()
-            .flat_map(|c| [Some(c.pt()), c.pt_rtx()].into_iter())
+            .flat_map(|c| [Some(c.pt()), c.resend].into_iter())
             .flatten()
             .collect();
 
@@ -1017,7 +1050,7 @@ impl fmt::Debug for SdpPendingOffer {
 }
 
 impl Changes {
-    pub fn take_new_channels(&mut self) -> Vec<(ChannelId, DcepOpen)> {
+    pub fn take_new_channels(&mut self) -> Vec<(ChannelId, ChannelConfig)> {
         let mut v = vec![];
 
         if self.0.is_empty() {
@@ -1025,9 +1058,9 @@ impl Changes {
         }
 
         for i in (0..self.0.len()).rev() {
-            if matches!(&self.0[i], Change::AddChannel(_, _)) {
-                if let Change::AddChannel(id, dcep) = self.0.remove(i) {
-                    v.push((id, dcep));
+            if matches!(&self.0[i], Change::AddChannel(_)) {
+                if let Change::AddChannel(id) = self.0.remove(i) {
+                    v.push(id);
                 }
             }
         }
@@ -1090,7 +1123,7 @@ impl Changes {
         &'a self,
         index_start: usize,
         config: &'b CodecConfig,
-        exts: &'b Extensions,
+        exts: &'b ExtensionMap,
     ) -> impl Iterator<Item = MediaInner> + '_ {
         self.0
             .iter()
@@ -1116,7 +1149,7 @@ impl Change {
         &self,
         index: usize,
         config: &CodecConfig,
-        exts: &Extensions,
+        exts: &ExtensionMap,
     ) -> Option<MediaInner> {
         use Change::*;
         match self {

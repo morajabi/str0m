@@ -287,7 +287,16 @@ impl Pacer for LeakyBucketPacer {
         self.clear_debt(elapsed);
         self.maybe_update_adjusted_bitrate(now);
 
-        if self.next_poll_outcome.is_some() {
+        // We skip recalculating the next poll outcome if we already have one, with the exception
+        // when the next action is padding. The reason we still recalculate if the outcome is
+        // padding is that something more important might still be required i.e. we might have
+        // queued media packets.
+        let recalculate = matches!(
+            self.next_poll_outcome,
+            Some(PollOutcome::PollPadding(_, _)) | None
+        );
+
+        if !recalculate {
             return;
         }
         self.next_send_time = None;
@@ -472,7 +481,9 @@ impl LeakyBucketPacer {
 
                 (now, queue, true)
             }
-            (Some(queue), bitrate, _, _) if bitrate > Bitrate::ZERO => {
+            (Some(queue), bitrate, _, _)
+                if bitrate > Bitrate::ZERO && self.adjusted_bitrate > Bitrate::ZERO =>
+            {
                 // If we have a non-empty queue send on it as soon as possible, possibly waiting
                 // for the next pacing interval.
                 let drain_debt_time = self.media_debt / self.adjusted_bitrate;
@@ -495,6 +506,7 @@ impl LeakyBucketPacer {
             (None, _, padding_bitrate, padding_to_add)
                 if padding_bitrate > Bitrate::ZERO
                     && padding_to_add == DataSize::ZERO
+                    && self.adjusted_bitrate > Bitrate::ZERO
                     && !too_many_padding_packets =>
             {
                 // If all queues are empty and we have a padding rate wait until we have drained
@@ -775,8 +787,8 @@ mod test {
             now + duration_ms(52),
         );
 
-        // // Audio packets are unpaced and we should be able to send it out even if we have too much
-        // // media debt.
+        // Audio packets are unpaced and we should be able to send it out even if we have too much
+        // media debt.
         assert_poll_success(
             &mut pacer,
             &mut queue,
@@ -1029,7 +1041,7 @@ mod test {
             use_for_padding: true,
             snapshot: QueueSnapshot {
                 created_at: now,
-                size: 10_usize.into(),
+                size: 10_usize,
                 packet_count: 1332,
                 total_queue_time_origin: duration_ms(1_000),
                 last_emitted: Some(now + duration_ms(500)),
@@ -1043,7 +1055,7 @@ mod test {
             use_for_padding: false,
             snapshot: QueueSnapshot {
                 created_at: now,
-                size: 30_usize.into(),
+                size: 30_usize,
                 packet_count: 5,
                 total_queue_time_origin: duration_ms(337),
                 last_emitted: None,
@@ -1111,7 +1123,7 @@ mod test {
         };
         queue.enqueue_packet(queued_packet);
 
-        // Matches the queueing behaviour when the pacer is used in real code.
+        // Matches the queueing behavior when the pacer is used in real code.
         // Each packet being queued causes time to move forward in the pacer and the queue.
         queue.update_average_queue_time(now);
         pacer.handle_timeout(now, queue.queue_state(now));
@@ -1215,7 +1227,7 @@ mod test {
 
         impl QueuedPacket {
             pub(super) fn size(&self) -> usize {
-                self.payload.len().into()
+                self.payload.len()
             }
         }
 

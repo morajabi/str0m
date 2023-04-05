@@ -2,19 +2,20 @@ use std::collections::{HashMap, VecDeque};
 use std::time::{Duration, Instant};
 
 use crate::dtls::KeyingMaterial;
+use crate::format::CodecConfig;
 use crate::io::{DatagramSend, DATAGRAM_MTU, DATAGRAM_MTU_WARN};
-use crate::media::{CodecConfig, MediaAdded, MediaChanged, Source};
+use crate::media::{MediaAdded, MediaChanged, Source};
 use crate::packet::{
     LeakyBucketPacer, NullPacer, Pacer, PacerImpl, PollOutcome, RtpMeta, SendSideBandwithEstimator,
 };
 use crate::rtp::SRTCP_OVERHEAD;
 use crate::rtp::{extend_seq, RtpHeader, SessionId, TwccRecvRegister, TwccSendRegister};
-use crate::rtp::{Bitrate, Extensions, MediaTime, Mid, Rtcp, RtcpFb};
+use crate::rtp::{Bitrate, ExtensionMap, MediaTime, Mid, Rtcp, RtcpFb};
 use crate::rtp::{SrtpContext, SrtpKey, Ssrc};
 use crate::stats::StatsSnapshot;
 use crate::util::{already_happened, not_happening, Soonest};
-use crate::RtcError;
 use crate::{net, KeyframeRequest, MediaData};
+use crate::{RtcConfig, RtcError};
 
 use super::MediaInner;
 
@@ -27,7 +28,7 @@ const NACK_MIN_INTERVAL: Duration = Duration::from_millis(100);
 const TWCC_INTERVAL: Duration = Duration::from_millis(100);
 
 const PACING_FACTOR: f64 = 2.5;
-const PADDING_FACTOR: f64 = 1.03;
+const PADDING_FACTOR: f64 = 1.00;
 
 pub(crate) struct Session {
     id: SessionId,
@@ -41,8 +42,8 @@ pub(crate) struct Session {
     app: Option<(Mid, usize)>,
 
     /// Extension mappings are _per BUNDLE_, but we can only have one a=group BUNDLE
-    /// in WebRTC (one ice connection), so they are effetively per session.
-    pub exts: Extensions,
+    /// in WebRTC (one ice connection), so they are effectively per session.
+    pub exts: ExtensionMap,
     pub codec_config: CodecConfig,
 
     /// Internally all ReceiverSource and SenderSource are identified by mid/ssrc.
@@ -68,6 +69,7 @@ pub(crate) struct Session {
     twcc_tx_register: TwccSendRegister,
 
     bwe: Option<SendSideBandwithEstimator>,
+    bwe_desired_bitrate: Bitrate,
 
     enable_twcc_feedback: bool,
 
@@ -91,18 +93,14 @@ pub enum MediaEvent {
 }
 
 impl Session {
-    pub fn new(
-        codec_config: CodecConfig,
-        ice_lite: bool,
-        bwe_initial_bitrate: Option<Bitrate>,
-    ) -> Self {
+    pub fn new(config: &RtcConfig) -> Self {
         let mut id = SessionId::new();
         // Max 2^62 - 1: https://bugzilla.mozilla.org/show_bug.cgi?id=861895
         const MAX_ID: u64 = 2_u64.pow(62) - 1;
         while *id > MAX_ID {
             id = (*id >> 1).into();
         }
-        let (pacer, bwe) = if let Some(rate) = bwe_initial_bitrate {
+        let (pacer, bwe) = if let Some(rate) = config.bwe_initial_bitrate {
             let pacer = PacerImpl::LeakyBucket(LeakyBucketPacer::new(
                 rate * PACING_FACTOR * 2.0,
                 Duration::from_millis(40),
@@ -119,8 +117,8 @@ impl Session {
             id,
             medias: vec![],
             app: None,
-            exts: Extensions::default_mappings(),
-            codec_config,
+            exts: config.exts,
+            codec_config: config.codec_config.clone(),
             source_keys: HashMap::new(),
             first_ssrc_remote: None,
             first_ssrc_local: None,
@@ -133,10 +131,11 @@ impl Session {
             twcc_rx_register: TwccRecvRegister::new(100),
             twcc_tx_register: TwccSendRegister::new(1000),
             bwe,
+            bwe_desired_bitrate: Bitrate::ZERO,
             enable_twcc_feedback: false,
             pacer,
             poll_packet_buf: vec![0; 2000],
-            ice_lite,
+            ice_lite: config.ice_lite,
         }
     }
 
@@ -170,7 +169,7 @@ impl Session {
         self.medias.iter_mut().find(|m| m.mid() == mid)
     }
 
-    pub fn exts(&self) -> &Extensions {
+    pub fn exts(&self) -> &ExtensionMap {
         &self.exts
     }
 
@@ -348,7 +347,7 @@ impl Session {
             }
         };
         let clock_rate = match media.get_params(header.payload_type) {
-            Some(v) => v.clock_rate(),
+            Some(v) => v.spec().clock_rate,
             None => {
                 trace!("No codec params for {:?}", header.payload_type);
                 return;
@@ -389,8 +388,8 @@ impl Session {
 
         let is_rtx = source.is_rtx();
 
-        // The first few packets, the source is in "probabtion". However for rtx,
-        // we let them straight through, since it would be weird to require probabtion
+        // The first few packets, the source is in "probation". However for rtx,
+        // we let them straight through, since it would be weird to require probation
         // time for resends (they are not contiguous) in the receiver register.
         if !is_rtx && !source.is_valid() {
             trace!("Source is not (yet) valid, probably probation");
@@ -454,7 +453,7 @@ impl Session {
             }
 
             let params = media.get_params(header.payload_type).unwrap();
-            if let Some(pt) = params.pt_rtx() {
+            if let Some(pt) = params.resend() {
                 header.payload_type = pt;
             }
 
@@ -475,7 +474,7 @@ impl Session {
 
         // This is the "main" PT and it will differ to header.payload_type if this is a resend.
         let pt = params.pt();
-        let codec = params.codec();
+        let codec = params.spec().codec;
 
         let time = MediaTime::new(header.timestamp as i64, clock_rate as i64);
 
@@ -518,6 +517,9 @@ impl Session {
                         bwe.update(records, now);
                     }
                 }
+                // Not in the above if due to lifetime issues, still okay because the method
+                // doesn't do anything when BWE isn't configured.
+                self.configure_pacer_padding();
 
                 return Some(());
             }
@@ -829,14 +831,8 @@ impl Session {
     }
 
     pub fn set_bwe_desired_bitrate(&mut self, desired_bitrate: Bitrate) {
-        if let Some(bwe) = &mut self.bwe {
-            let padding_rate = bwe
-                .last_estimate()
-                .map(|bwe| (bwe * PADDING_FACTOR).min(desired_bitrate))
-                .unwrap_or(Bitrate::ZERO);
-
-            self.pacer.set_padding_rate(padding_rate);
-        }
+        self.bwe_desired_bitrate = desired_bitrate;
+        self.configure_pacer_padding();
     }
 
     pub fn line_count(&self) -> usize {
@@ -855,5 +851,18 @@ impl Session {
         for m in &mut self.medias {
             m.clear_send_buffers();
         }
+    }
+
+    fn configure_pacer_padding(&mut self) {
+        let Some(bwe) = self.bwe.as_ref() else {
+            return;
+        };
+
+        let padding_rate = bwe
+            .last_estimate()
+            .map(|bwe| (bwe * PADDING_FACTOR).min(self.bwe_desired_bitrate))
+            .unwrap_or(Bitrate::ZERO);
+
+        self.pacer.set_padding_rate(padding_rate);
     }
 }

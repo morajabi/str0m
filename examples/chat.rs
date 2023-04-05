@@ -80,8 +80,8 @@ fn web_request(request: &Request, addr: SocketAddr, tx: SyncSender<Rtc>) -> Resp
 
     let offer: SdpOffer = serde_json::from_reader(&mut data).expect("serialized offer");
     let mut rtc = Rtc::builder()
-        .ice_lite(true)
-        .stats_interval(Duration::from_secs(5))
+        .set_ice_lite(true)
+        .set_stats_interval(Duration::from_secs(5))
         .build();
 
     // Add the shared UDP socket as a host candidate
@@ -410,7 +410,7 @@ impl Client {
                 return Propagated::Noop;
             };
 
-        // This is the rid picked from incoming medidata, and to which we need to
+        // This is the rid picked from incoming mediadata, and to which we need to
         // send the keyframe request.
         req.rid = self.chosen_rid;
 
@@ -428,7 +428,9 @@ impl Client {
         for track in &mut self.tracks_out {
             if let TrackOutState::ToOpen = track.state {
                 if let Some(track_in) = track.track_in.upgrade() {
-                    let mid = change.add_media(track_in.kind, Direction::SendOnly, None);
+                    let stream_id = track_in.origin.to_string();
+                    let mid =
+                        change.add_media(track_in.kind, Direction::SendOnly, Some(stream_id), None);
                     track.state = TrackOutState::Negotiating(mid);
                 }
             }

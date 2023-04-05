@@ -69,7 +69,7 @@ rtc.add_local_candidate(candidate);
 let mut change = rtc.sdp_api();
 
 // Do some change. A valid OFFER needs at least one "m-line" (media).
-let mid = change.add_media(MediaKind::Audio, Direction::SendRecv, None);
+let mid = change.add_media(MediaKind::Audio, Direction::SendRecv, None, None);
 
 // Get the offer.
 let (offer, pending) = change.apply().unwrap();
@@ -209,7 +209,7 @@ str0m has three main concepts of time. "now", media time and wallclock.
 #### Now
 
 Some calls in str0m, such as `Rtc::handle_input` takes a `now` argument
-that is a `std::time::Intant`. These calls "drive the time forward" in
+that is a `std::time::Instant`. These calls "drive the time forward" in
 the internal state. This is used for everything like deciding when
 to produce various feedback reports (RTCP) to remote peers, to
 bandwidth estimation (BWE) and statistics.

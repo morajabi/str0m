@@ -1,7 +1,8 @@
 use std::net::Ipv4Addr;
 use std::time::Duration;
 
-use str0m::media::{Codec, Direction, MediaKind, MediaTime};
+use str0m::format::Codec;
+use str0m::media::{Direction, MediaKind, MediaTime};
 use str0m::{Candidate, RtcError};
 use tracing::info_span;
 
@@ -21,7 +22,7 @@ pub fn bidirectional_same_m_line() -> Result<(), RtcError> {
     r.add_local_candidate(host2);
 
     let mut change = l.sdp_api();
-    let mid = change.add_media(MediaKind::Audio, Direction::SendRecv, None);
+    let mid = change.add_media(MediaKind::Audio, Direction::SendRecv, None, None);
     let (offer, pending) = change.apply().unwrap();
 
     let answer = r.rtc.sdp_api().accept_offer(offer)?;
@@ -39,7 +40,7 @@ pub fn bidirectional_same_m_line() -> Result<(), RtcError> {
     r.last = max;
 
     let params = l.media(mid).unwrap().payload_params()[0];
-    assert_eq!(params.codec(), Codec::Opus);
+    assert_eq!(params.spec().codec, Codec::Opus);
     let pt = params.pt();
     const STEP: MediaTime = MediaTime::new(960, 48_000);
 

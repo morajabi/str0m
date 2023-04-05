@@ -10,7 +10,7 @@ use {
 
 use crate::dtls::Fingerprint;
 use crate::ice::{Candidate, CandidateKind};
-use crate::rtp::{Direction, ExtMap, Extension, Mid, Pt, SessionId, Ssrc};
+use crate::rtp::{Direction, Extension, Mid, Pt, SessionId, Ssrc};
 
 use super::data::*;
 
@@ -106,7 +106,7 @@ where
     typed_line('a', (string(attribute)).map(|_| ()))
 }
 
-/// a=foo:bar lines belongin before the first m= line
+/// a=foo:bar lines belonging before the first m= line
 fn session_attribute_line<Input>() -> impl Parser<Input, Output = SessionAttribute>
 where
     Input: Stream<Token = char>,
@@ -123,6 +123,23 @@ where
         ),
     )
     .map(|(typ, _, mids)| SessionAttribute::Group { typ, mids });
+
+    // a=msid-semantic: WMS 9ce81ef6-c7cb-4da5-8f5f-3e7cc9b5f9b0
+    let msid_semantic = attribute_line(
+        "msid-semantic",
+        (
+            optional(token(' ')),
+            not_sp(),
+            token(' '),
+            sep_by1(not_sp(), token(' ')),
+        ),
+    )
+    .map(
+        |(_, semantic, _, stream_ids)| SessionAttribute::MsidSemantic {
+            semantic,
+            stream_ids,
+        },
+    );
 
     // a=ice-lite
     let ice_lite = attribute_line_flag("ice-lite").map(|_| SessionAttribute::IceLite);
@@ -171,6 +188,7 @@ where
 
     choice((
         attempt(group),
+        attempt(msid_semantic),
         attempt(ice_lite),
         attempt(ice_ufrag),
         attempt(ice_pwd),
@@ -367,7 +385,7 @@ where
     .map(|(typ, _, _, _, proto, _, pts)| (typ, proto, pts))
 }
 
-/// a=foo:bar lines belongin before the first m= line
+/// a=foo:bar lines belonging before the first m= line
 fn media_attribute_line<Input>() -> impl Parser<Input, Output = MediaAttribute>
 where
     Input: Stream<Token = char>,
@@ -445,13 +463,7 @@ where
             optional((token(' '), any_value())),
         ),
     )
-    .map(|(id, dir_opt, _, ext_type, _ext_opt)| {
-        MediaAttribute::ExtMap(ExtMap {
-            id,
-            direction: dir_opt.map(|(_, d)| d),
-            ext: ext_type,
-        })
-    });
+    .map(|(id, _dir_opt, _, ext, _ext_opt)| MediaAttribute::ExtMap { id, ext });
 
     let direction = choice((
         attempt(attribute_line_flag("recvonly").map(|_| MediaAttribute::RecvOnly)),
@@ -512,12 +524,14 @@ where
     )
     .map(|(pt, _, codec, _, clock_rate, opt_channels)| {
         let channels = opt_channels.map(|(_, e)| e);
-        MediaAttribute::RtpMap(CodecSpec {
+        MediaAttribute::RtpMap {
             pt,
-            codec: codec.as_str().into(),
-            clock_rate,
-            channels,
-        })
+            value: RtpMap {
+                codec: codec.as_str().into(),
+                clock_rate,
+                channels,
+            },
+        }
     });
 
     // a=rtcp-fb:111 transport-cc
@@ -977,7 +991,10 @@ mod test {
                                 ]
                             }),
                             SessionAttribute::IceOptions("trickle".to_string()),
-                            SessionAttribute::Unused("msid-semantic:WMS *".into())
+                            SessionAttribute::MsidSemantic {
+                                semantic: "WMS".into(),
+                                stream_ids: vec!["*".into()]
+                            },
                         ]
                     },
                     media_lines: vec![]

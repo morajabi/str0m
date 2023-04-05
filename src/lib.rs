@@ -70,7 +70,7 @@
 //! let mut change = rtc.sdp_api();
 //!
 //! // Do some change. A valid OFFER needs at least one "m-line" (media).
-//! let mid = change.add_media(MediaKind::Audio, Direction::SendRecv, None);
+//! let mid = change.add_media(MediaKind::Audio, Direction::SendRecv, None, None);
 //!
 //! // Get the offer.
 //! let (offer, pending) = change.apply().unwrap();
@@ -220,7 +220,7 @@
 //! ### Now
 //!
 //! Some calls in str0m, such as `Rtc::handle_input` takes a `now` argument
-//! that is a `std::time::Intant`. These calls "drive the time forward" in
+//! that is a `std::time::Instant`. These calls "drive the time forward" in
 //! the internal state. This is used for everything like deciding when
 //! to produce various feedback reports (RTCP) to remote peers, to
 //! bandwidth estimation (BWE) and statistics.
@@ -481,25 +481,31 @@ mod rtp;
 mod sctp;
 mod sdp;
 
+pub mod format;
+
 use std::fmt;
 use std::net::SocketAddr;
 use std::time::{Duration, Instant};
 
 use change::{DirectApi, SdpApi};
+use dtls::DtlsCert;
 use dtls::{Dtls, DtlsEvent};
+use format::CodecConfig;
 use ice::IceAgent;
 use ice::IceAgentEvent;
+use ice::IceCreds;
 use io::DatagramRecv;
-use rtp::{InstantExt, Ssrc};
+use rtp::{Extension, ExtensionMap, InstantExt, Ssrc};
 use sctp::{RtcSctp, SctpEvent};
 
 use stats::{MediaEgressStats, MediaIngressStats, PeerStats, Stats, StatsEvent};
 use thiserror::Error;
 
-pub use ice::{IceConnectionState, IceCreds};
+pub use ice::IceConnectionState;
 
 pub use dtls::Fingerprint;
-pub use ice::{Candidate, CandidateKind};
+pub use ice::Candidate;
+pub use ice::CandidateKind;
 pub use rtp::Bitrate;
 
 /// Network related types to get socket data in/out of [`Rtc`].
@@ -519,10 +525,10 @@ pub mod error {
 }
 
 pub mod channel;
-use channel::{Channel, ChannelData, ChannelId};
+use channel::{Channel, ChannelData, ChannelHandler, ChannelId};
 
 pub mod media;
-use media::{CodecConfig, Direction, KeyframeRequest, Media};
+use media::{Direction, KeyframeRequest, Media};
 use media::{KeyframeRequestKind, MediaChanged, MediaData};
 use media::{MediaAdded, MediaInner, Mid, Pt, Rid};
 
@@ -637,7 +643,7 @@ pub enum RtcError {
 ///     };
 ///
 ///     // TODO: Wait for one of two events, reaching `timeout`
-///     //       or receiving network input. Both are encapsualted
+///     //       or receiving network input. Both are encapsulated
 ///     //       in the Input enum.
 ///     let input: Input = todo!();
 ///
@@ -649,6 +655,7 @@ pub struct Rtc {
     ice: IceAgent,
     dtls: Dtls,
     sctp: RtcSctp,
+    chan: ChannelHandler,
     stats: Stats,
     session: Session,
     remote_fingerprint: Option<Fingerprint>,
@@ -657,24 +664,12 @@ pub struct Rtc {
     last_now: Instant,
     peer_bytes_rx: u64,
     peer_bytes_tx: u64,
-    sctp_allocations: Vec<SctpChannelAllocation>,
     change_counter: usize,
 }
 
 struct SendAddr {
     source: SocketAddr,
     destination: SocketAddr,
-}
-
-/// External-to-internal mapping of `ChannelId` to _actual_ SCTP channel.
-/// This is necessary because before the initial OFFER/ANSWER we don't know
-/// whether we are active or passive in the DTLS/SCTP setup.
-struct SctpChannelAllocation {
-    /// The outward channel id. This increases 0, 1, 2, 3...
-    public: ChannelId,
-    /// The internal channel id. If we're SCTP client, this goes
-    /// 0, 2, 4... and if we're server 1, 3, 5...
-    sctp_channel: Option<u16>,
 }
 
 /// Events produced by [`Rtc::poll_output()`].
@@ -780,7 +775,7 @@ impl Rtc {
     /// ```
     /// # use str0m::Rtc;
     /// let rtc = Rtc::builder()
-    ///     .ice_lite(true)
+    ///     .set_ice_lite(true)
     ///     .build();
     /// ```
     pub fn builder() -> RtcConfig {
@@ -788,8 +783,9 @@ impl Rtc {
     }
 
     pub(crate) fn new_from_config(config: RtcConfig) -> Self {
-        let mut ice = IceAgent::new();
+        let session = Session::new(&config);
 
+        let mut ice = IceAgent::with_local_credentials(config.local_ice_credentials);
         if config.ice_lite {
             ice.set_ice_lite(config.ice_lite);
         }
@@ -797,13 +793,10 @@ impl Rtc {
         Rtc {
             alive: true,
             ice,
-            dtls: Dtls::new().expect("DTLS to init without problem"),
-            session: Session::new(
-                config.codec_config,
-                config.ice_lite,
-                config.bwe_initial_bitrate,
-            ),
+            dtls: Dtls::new(config.dtls_cert).expect("DTLS to init without problem"),
+            session,
             sctp: RtcSctp::new(),
+            chan: ChannelHandler::default(),
             stats: Stats::new(config.stats_interval),
             remote_fingerprint: None,
             remote_addrs: vec![],
@@ -811,7 +804,6 @@ impl Rtc {
             last_now: already_happened(),
             peer_bytes_rx: 0,
             peer_bytes_tx: 0,
-            sctp_allocations: vec![],
             change_counter: 0,
         }
     }
@@ -886,7 +878,7 @@ impl Rtc {
     /// For [`SdpApi`]: Remote candidates are typically added via
     /// receiving a remote [`SdpOffer`][change::SdpOffer] or [`SdpAnswer`][change::SdpAnswer].
     ///
-    /// However for the case of [Trickle Ice][1], this is the way to add remote candidaes
+    /// However for the case of [Trickle Ice][1], this is the way to add remote candidates
     /// that are "trickled" from the other side.
     ///
     /// ```
@@ -932,8 +924,8 @@ impl Rtc {
     /// let mut rtc = Rtc::new();
     ///
     /// let mut changes = rtc.sdp_api();
-    /// let mid_audio = changes.add_media(MediaKind::Audio, Direction::SendOnly, None);
-    /// let mid_video = changes.add_media(MediaKind::Video, Direction::SendOnly, None);
+    /// let mid_audio = changes.add_media(MediaKind::Audio, Direction::SendOnly, None, None);
+    /// let mid_video = changes.add_media(MediaKind::Video, Direction::SendOnly, None, None);
     ///
     /// let (offer, pending) = changes.apply().unwrap();
     /// let json = serde_json::to_vec(&offer).unwrap();
@@ -972,19 +964,11 @@ impl Rtc {
     fn init_sctp(&mut self, client: bool) {
         // If we got an m=application line, ensure we have negotiated the
         // SCTP association with the other side.
-        if self.session.app().is_none() || self.sctp.is_inited() {
+        if self.sctp.is_inited() {
             return;
         }
-        self.sctp.init(client, self.last_now);
 
-        for s in self
-            .sctp_allocations
-            .iter_mut()
-            .filter(|s| s.sctp_channel.is_none())
-        {
-            let c = self.sctp.next_sctp_channel();
-            s.sctp_channel = Some(c);
-        }
+        self.sctp.init(client, self.last_now);
     }
 
     /// Creates a new Mid that is not in the session already.
@@ -995,14 +979,6 @@ impl Rtc {
                 break mid;
             }
         }
-    }
-
-    /// Creates the new SCTP channel.
-    pub(crate) fn new_sctp_channel(&mut self) -> ChannelId {
-        // If SCTP is not started, we will not allocate this now, see init_sctp().
-        let sctp_channel = self.sctp.is_inited().then(|| self.sctp.next_sctp_channel());
-
-        self.associate_new_sctp(sctp_channel)
     }
 
     /// Creates an Ssrc that is not in the session already.
@@ -1109,34 +1085,38 @@ impl Rtc {
 
         while let Some(e) = self.sctp.poll() {
             match e {
-                SctpEvent::Transmit(mut q) => {
-                    if let Some(v) = q.front() {
+                SctpEvent::Transmit { mut packets } => {
+                    if let Some(v) = packets.front() {
                         if let Err(e) = self.dtls.handle_input(v) {
                             if e.is_would_block() {
-                                self.sctp.push_back_transmit(q);
+                                self.sctp.push_back_transmit(packets);
                                 break;
                             } else {
                                 return Err(e.into());
                             }
                         }
-                        q.pop_front();
+                        packets.pop_front();
                         break;
                     }
                 }
-                SctpEvent::Open(sctp_channel, dcep) => {
-                    let id = self.associate_new_sctp(Some(sctp_channel));
-
-                    return Ok(Output::Event(Event::ChannelOpen(id, dcep.label)));
+                SctpEvent::Open { id, label } => {
+                    self.chan.ensure_channel_id_for(id);
+                    let id = self.chan.channel_id_by_stream_id(id).unwrap();
+                    return Ok(Output::Event(Event::ChannelOpen(id, label)));
                 }
-                SctpEvent::Close(id) => {
-                    return Ok(Output::Event(Event::ChannelClose(id.into())));
-                }
-                SctpEvent::Data(id, binary, data) => {
-                    let cd = ChannelData {
-                        id: id.into(),
-                        binary,
-                        data,
+                SctpEvent::Close { id } => {
+                    let Some(id) = self.chan.channel_id_by_stream_id(id) else {
+                        warn!("Drop ChannelClose event for id: {:?}", id);
+                        continue;
                     };
+                    return Ok(Output::Event(Event::ChannelClose(id)));
+                }
+                SctpEvent::Data { id, binary, data } => {
+                    let Some(id) = self.chan.channel_id_by_stream_id(id) else {
+                        warn!("Drop ChannelData event for id: {:?}", id);
+                        continue;
+                    };
+                    let cd = ChannelData { id, binary, data };
                     return Ok(Output::Event(Event::ChannelData(cd)));
                 }
             }
@@ -1190,6 +1170,7 @@ impl Rtc {
             .soonest((self.ice.poll_timeout(), "ice"))
             .soonest((self.session.poll_timeout(), "session"))
             .soonest((self.sctp.poll_timeout(), "sctp"))
+            .soonest((self.chan.poll_timeout(&self.sctp), "chan"))
             .soonest((self.stats.poll_timeout(), "stats"));
 
         // trace!("poll_output timeout reason: {}", time_and_reason.1);
@@ -1211,7 +1192,7 @@ impl Rtc {
     ///
     /// [`Input::Timeout`] is always accepted. [`Input::Receive`] is tested against the nominated
     /// ICE candidate. If that doesn't match and the incoming data is a STUN packet, the accept call
-    /// is delegated to the ICE agent which recognises the remote peer from `a=ufrag`/`a=password`
+    /// is delegated to the ICE agent which recognizes the remote peer from `a=ufrag`/`a=password`
     /// credentials negotiated in the SDP.
     ///
     /// In a server setup, the server would try to find an `Rtc` instances using [`Rtc::accepts()`].
@@ -1306,6 +1287,7 @@ impl Rtc {
         self.last_now = now;
         self.ice.handle_timeout(now);
         self.sctp.handle_timeout(now);
+        self.chan.handle_timeout(now, &mut self.sctp);
         self.session.handle_timeout(now);
         if self.stats.wants_timeout(now) {
             let mut snapshot = StatsSnapshot::new(now);
@@ -1387,20 +1369,13 @@ impl Rtc {
             return None;
         }
 
-        // If the m=application isn't set up, we don't provide Channel
-        (*self.session.app())?;
+        let sctp_stream_id = self.chan.stream_id_by_channel_id(id)?;
 
-        let sctp_channel = self
-            .sctp_allocations
-            .iter()
-            .find(|s| s.public == id)
-            .and_then(|s| s.sctp_channel)?;
-
-        if !self.sctp.is_open(sctp_channel) {
+        if !self.sctp.is_open(sctp_stream_id) {
             return None;
         }
 
-        Some(Channel::new(sctp_channel, self))
+        Some(Channel::new(sctp_stream_id, self))
     }
 
     /// Configure the Bandwidth Estimate (BWE) subsystem.
@@ -1414,21 +1389,6 @@ impl Rtc {
         snapshot.peer_rx = self.peer_bytes_rx;
         snapshot.peer_tx = self.peer_bytes_tx;
         self.session.visit_stats(now, snapshot);
-    }
-
-    fn associate_new_sctp(&mut self, sctp_channel: Option<u16>) -> ChannelId {
-        let id = self.sctp_allocations.len() as u16;
-
-        let alloc = SctpChannelAllocation {
-            public: id.into(),
-            sctp_channel,
-        };
-
-        let ret = alloc.public;
-
-        self.sctp_allocations.push(alloc);
-
-        ret
     }
 
     fn is_correct_change_id(&self, change_id: usize) -> bool {
@@ -1454,21 +1414,24 @@ impl Rtc {
     }
 }
 
-/// Customised config for creating an [`Rtc`] instance.
+/// Customized config for creating an [`Rtc`] instance.
 ///
 /// ```
 /// use str0m::RtcConfig;
 ///
 /// let rtc = RtcConfig::new()
-///     .ice_lite(true)
+///     .set_ice_lite(true)
 ///     .build();
 /// ```
 ///
 /// Configs implement [`Clone`] to help create multiple `Rtc` instances.
 #[derive(Debug, Clone)]
 pub struct RtcConfig {
+    local_ice_credentials: IceCreds,
+    dtls_cert: DtlsCert,
     ice_lite: bool,
     codec_config: CodecConfig,
+    exts: ExtensionMap,
     stats_interval: Duration,
     /// Whether to use Bandwidth Estimation to discover the egress bandwidth.
     bwe_initial_bitrate: Option<Bitrate>,
@@ -1480,6 +1443,18 @@ impl RtcConfig {
         RtcConfig::default()
     }
 
+    /// The auto generated local ice credentials.
+    pub fn local_ice_credentials(&self) -> &IceCreds {
+        &self.local_ice_credentials
+    }
+
+    /// The configured DtlsCert.
+    ///
+    /// The certificate is uniquely created per new RtcConfig.
+    pub fn dtls_cert(&self) -> &DtlsCert {
+        &self.dtls_cert
+    }
+
     /// Toggle ice lite. Ice lite is a mode for WebRTC servers with public IP address.
     /// An [`Rtc`] instance in ice lite mode will not make STUN binding requests, but only
     /// answer to requests from the remote peer.
@@ -1489,9 +1464,14 @@ impl RtcConfig {
     /// Defaults to `false`.
     ///
     /// [1]: https://www.rfc-editor.org/rfc/rfc8445#page-13
-    pub fn ice_lite(mut self, enabled: bool) -> Self {
+    pub fn set_ice_lite(mut self, enabled: bool) -> Self {
         self.ice_lite = enabled;
         self
+    }
+
+    /// Lower level access to precis configuration of codecs (payload types).
+    pub fn codec_config(&mut self) -> &mut CodecConfig {
+        &mut self.codec_config
     }
 
     /// Clear all configured codecs.
@@ -1502,8 +1482,8 @@ impl RtcConfig {
     /// // For the session to use only OPUS and VP8.
     /// let mut rtc = RtcConfig::default()
     ///     .clear_codecs()
-    ///     .enable_opus()
-    ///     .enable_vp8()
+    ///     .enable_opus(true)
+    ///     .enable_vp8(true)
     ///     .build();
     /// ```
     pub fn clear_codecs(mut self) -> Self {
@@ -1514,24 +1494,24 @@ impl RtcConfig {
     /// Enable opus audio codec.
     ///
     /// Enabled by default.
-    pub fn enable_opus(mut self) -> Self {
-        self.codec_config.add_default_opus();
+    pub fn enable_opus(mut self, enabled: bool) -> Self {
+        self.codec_config.enabe_opus(enabled);
         self
     }
 
     /// Enable VP8 video codec.
     ///
     /// Enabled by default.
-    pub fn enable_vp8(mut self) -> Self {
-        self.codec_config.add_default_vp8();
+    pub fn enable_vp8(mut self, enabled: bool) -> Self {
+        self.codec_config.enable_vp8(enabled);
         self
     }
 
     /// Enable H264 video codec.
     ///
     /// Enabled by default.
-    pub fn enable_h264(mut self) -> Self {
-        self.codec_config.add_default_h264();
+    pub fn enable_h264(mut self, enabled: bool) -> Self {
+        self.codec_config.enable_h264(enabled);
         self
     }
 
@@ -1548,29 +1528,63 @@ impl RtcConfig {
     /// Enable VP9 video codec.
     ///
     /// Enabled by default.
-    pub fn enable_vp9(mut self) -> Self {
-        self.codec_config.add_default_vp9();
+    pub fn enable_vp9(mut self, enabled: bool) -> Self {
+        self.codec_config.enable_vp9(enabled);
         self
     }
 
-    /// Lower level access to precis configuration of codecs (payload types).
-    pub fn codec_config(&mut self) -> &mut CodecConfig {
-        &mut self.codec_config
+    /// Configure the RTP extension mappings.
+    ///
+    /// The default extension map is
+    ///
+    /// ```
+    /// # use str0m::media::rtp::{Extension, ExtensionMap};
+    /// let exts = ExtensionMap::standard();
+    /// assert_eq!(exts.id_of(Extension::AudioLevel), Some(1));
+    /// assert_eq!(exts.id_of(Extension::AbsoluteSendTime), Some(2));
+    /// assert_eq!(exts.id_of(Extension::TransportSequenceNumber), Some(3));
+    /// assert_eq!(exts.id_of(Extension::RtpMid), Some(4));
+    /// assert_eq!(exts.id_of(Extension::RtpStreamId), Some(10));
+    /// assert_eq!(exts.id_of(Extension::RepairedRtpStreamId), Some(11));
+    /// assert_eq!(exts.id_of(Extension::VideoOrientation), Some(13));
+    /// ```
+    pub fn extension_map(&mut self) -> &mut ExtensionMap {
+        &mut self.exts
+    }
+
+    /// Clear out the standard extension mappings.
+    pub fn clear_extension_map(mut self) -> Self {
+        self.exts.clear();
+
+        self
+    }
+
+    /// Set an extension mapping on session level.
+    ///
+    /// The media level will be capped by the extension enabled on session level.
+    ///
+    /// The id must be 1-14 inclusive (1-indexed).
+    pub fn set_extension(mut self, id: u8, ext: Extension) -> Self {
+        self.exts.set(id, ext);
+        self
     }
 
     /// Set the interval between statistics events
     /// This includes Event::MediaEgressStats, Event::MediaIngressStats, Event::MediaEgressStats
     ///
     /// Defaults to `Duration::from_secs(1)`.
-    pub fn stats_interval(mut self, interval: Duration) -> Self {
+    pub fn set_stats_interval(mut self, interval: Duration) -> Self {
         self.stats_interval = interval;
         self
     }
 
-    /// Enables the estimation of the available send bandwidth.
+    /// Enables estimation of available bandwidth (BWE).
+    ///
+    /// None disables the BWE. This is an estimation of the send bandwidth, not receive.
+    ///
     /// This includes setting the initial estimate to start with.
-    pub fn enable_bwe(mut self, initial_estimate: Bitrate) -> Self {
-        self.bwe_initial_bitrate = Some(initial_estimate);
+    pub fn enable_bwe(mut self, initial_estimate: Option<Bitrate>) -> Self {
+        self.bwe_initial_bitrate = initial_estimate;
 
         self
     }
@@ -1584,8 +1598,11 @@ impl RtcConfig {
 impl Default for RtcConfig {
     fn default() -> Self {
         Self {
+            local_ice_credentials: IceCreds::new(),
+            dtls_cert: DtlsCert::new(),
             ice_lite: false,
             codec_config: CodecConfig::new_with_defaults(),
+            exts: ExtensionMap::standard(),
             stats_interval: Duration::from_secs(1),
             bwe_initial_bitrate: None,
         }

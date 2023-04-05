@@ -3,10 +3,9 @@ use std::time::Instant;
 use crate::rtp::{Direction, ExtensionValues, MediaTime, Mid, Pt, Rid};
 use crate::sdp::Simulcast as SdpSimulcast;
 
-pub use crate::sdp::{Codec, FormatParams};
-
 use super::PayloadParams;
-use crate::media::rtp::{CodecExtra, RtpMeta};
+use crate::format::CodecExtra;
+use crate::media::rtp::RtpMeta;
 
 pub use crate::packet::MediaKind;
 
@@ -92,14 +91,14 @@ pub struct MediaData {
     /// from one packet to the next.
     pub pt: Pt,
 
-    /// Rtp Stream Id (RID) identifies an RTP stream without refering to its
+    /// Rtp Stream Id (RID) identifies an RTP stream without referring to its
     /// Synchronization Source (SSRC).
     ///
     /// This is a newer standard that is sometimes used in WebRTC to identify
     /// a stream. Specifically when using Simulcast in Chrome.
     pub rid: Option<Rid>,
 
-    /// Parameters for the codec. This is used to match incoming PT to ougoing PT.
+    /// Parameters for the codec. This is used to match incoming PT to outgoing PT.
     pub params: PayloadParams,
 
     /// The RTP media time of this packet. Media time is described as a nominator/denominator

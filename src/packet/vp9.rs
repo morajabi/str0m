@@ -127,6 +127,10 @@ impl Packetizer for Vp9Packetizer {
 
         Ok(payloads)
     }
+
+    fn is_marker(&mut self, data: &[u8], previous: Option<&[u8]>, last: bool) -> bool {
+        last
+    }
 }
 
 /// Depacketizes VP9 RTP packets.
@@ -184,7 +188,7 @@ pub struct Vp9Depacketizer {
     pub pgtid: Vec<u8>,
     /// Switching up point of pictures in a Picture Group
     pub pgu: Vec<bool>,
-    /// Reference indecies of pictures in a Picture Group
+    /// Reference indices of pictures in a Picture Group
     pub pgpdiff: Vec<Vec<u8>>,
 }
 
