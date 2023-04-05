@@ -676,6 +676,9 @@ struct SendAddr {
 #[non_exhaustive]
 #[allow(clippy::large_enum_variant)]
 pub enum Event {
+    /// Emitted when we got ICE connection and established DTLS.
+    Connected,
+
     /// ICE connection state changes tells us whether the [`Rtc`] instance is
     /// connected to the peer or not.
     IceConnectionStateChange(IceConnectionState),
@@ -895,23 +898,12 @@ impl Rtc {
         self.ice.add_remote_candidate(c);
     }
 
-    /// Checks current connection state. This state is also obtained via
-    /// [`Event::IceConnectionStateChange`].
+    /// Checks if we are connected.
     ///
-    /// More details on connection states can be found in the [ICE RFC][1].
-    /// ```
-    /// # use str0m::{Rtc, IceConnectionState};
-    /// let mut rtc = Rtc::new();
+    /// This tests both if we have ICE connection and DTLS is ready.
     ///
-    /// assert_eq!(rtc.ice_connection_state(), IceConnectionState::New);
-    /// ```
-    ///
-    /// [1]: https://www.rfc-editor.org/rfc/rfc8445
-    // TODO decide if we actually want this both as an event and as a call.
-    // If we have this as a call, why don't we also have the DTLS and SCTP states?
-    #[doc(hidden)]
-    pub fn ice_connection_state(&self) -> IceConnectionState {
-        self.ice.state()
+    pub fn is_connected(&self) -> bool {
+        self.ice.state().is_connected() && self.dtls.is_connected()
     }
 
     /// Make changes to the Rtc session via SDP.
@@ -1054,10 +1046,13 @@ impl Rtc {
             }
         }
 
+        let mut dtls_connected = false;
+
         while let Some(e) = self.dtls.poll_event() {
             match e {
                 DtlsEvent::Connected => {
                     debug!("DTLS connected");
+                    dtls_connected = true;
                 }
                 DtlsEvent::SrtpKeyingMaterial(mat) => {
                     info!("DTLS set SRTP keying material");
@@ -1080,6 +1075,10 @@ impl Rtc {
                     self.sctp.handle_input(self.last_now, &v);
                 }
             }
+        }
+
+        if dtls_connected {
+            return Ok(Output::Event(Event::Connected));
         }
 
         while let Some(e) = self.sctp.poll() {
@@ -1160,9 +1159,6 @@ impl Rtc {
                 };
                 return Ok(Output::Transmit(t));
             }
-        } else {
-            // Keep send buffers empty until we have ice connected.
-            self.session.clear_send_buffers();
         }
 
         let time_and_reason = (None, "<not happening>")
