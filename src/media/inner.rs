@@ -109,12 +109,6 @@ pub(crate) struct MediaInner {
     /// Last time we produced regular feedback (SR/RR).
     last_regular_feedback: Instant,
 
-    /// Size of buffer for incoming audio (in RTP packets)
-    reorder_buffer_size_audio: usize,
-
-    /// Size of buffer for incoming video (in RTP packets)
-    reorder_buffer_size_video: usize,
-
     /// Buffers for incoming data.
     ///
     /// Video samples are often fragmented over several RTP packets. These buffers reassembles
@@ -739,11 +733,6 @@ impl MediaInner {
         self.last_cleanup + CLEANUP_INTERVAL
     }
 
-    pub fn set_reorder_buffer_sizes(&mut self, audio: usize, video: usize) {
-        self.reorder_buffer_size_audio = audio;
-        self.reorder_buffer_size_video = video;
-    }
-
     pub fn source_tx_ssrcs(&self) -> impl Iterator<Item = Ssrc> + '_ {
         self.sources_tx.iter().map(|s| s.ssrc())
     }
@@ -1008,14 +997,9 @@ impl MediaInner {
         rid: Option<Rid>,
         codec: Codec,
     ) -> &mut DepacketizingBuffer {
-        let hold_back_size = if codec.is_audio() {
-            self.reorder_buffer_size_audio
-        } else {
-            self.reorder_buffer_size_video
-        };
         self.buffers_rx
             .entry((pt, rid))
-            .or_insert_with(|| DepacketizingBuffer::new(codec.into(), hold_back_size))
+            .or_insert_with(|| DepacketizingBuffer::new(codec.into(), 30))
     }
 
     pub fn poll_keyframe_request(&mut self) -> Option<(Option<Rid>, KeyframeRequestKind)> {
@@ -1254,9 +1238,6 @@ impl Default for MediaInner {
             sources_tx: vec![],
             last_cleanup: already_happened(),
             last_regular_feedback: already_happened(),
-            // todo: make audio 0 by default?
-            reorder_buffer_size_audio: 3,
-            reorder_buffer_size_video: 30,
             buffers_rx: HashMap::new(),
             buffers_tx: HashMap::new(),
             resends: VecDeque::new(),

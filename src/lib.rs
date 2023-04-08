@@ -907,11 +907,6 @@ impl Rtc {
         self.ice.state().is_connected() && self.dtls.is_connected()
     }
 
-    /// Sets buffer size for the RTP packet reorder buffer in medias
-    pub fn set_reorder_buffer_size(&mut self, audio: usize, video: usize) {
-        self.session.set_reorder_buffer_size(audio, video);
-    }
-
     /// Make changes to the Rtc session via SDP.
     ///
     /// ```no_run
