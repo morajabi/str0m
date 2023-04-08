@@ -9,9 +9,9 @@ use rand::random;
 use thiserror::Error;
 
 // Consult libwebrtc for default values here.
-pub const STUN_INITIAL_RTO_MILLIS: u64 = 150;
-pub const STUN_MAX_RETRANS: usize = 15;
-pub const STUN_MAX_RTO_MILLIS: u64 = 1000;
+pub const STUN_INITIAL_RTO_MILLIS: u64 = 250;
+pub const STUN_MAX_RETRANS: usize = 9;
+pub const STUN_MAX_RTO_MILLIS: u64 = 3000;
 pub const STUN_TIMEOUT: Duration = Duration::from_secs(40); // the above algo gives us 39_750
 
 /// Calculate the send delay given how many times we tried.
