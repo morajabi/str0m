@@ -579,23 +579,23 @@ impl MediaInner {
                 // Find a historic packet that is smaller than this max size. The max size
                 // is a headroom since we can accept slightly larger padding than asked for.
                 let max_size = pad_size * 2;
-                let packet = buffer.historic_packet_smaller_than(max_size)?;
+                if let Some(packet) = buffer.historic_packet_smaller_than(max_size) {
+                    let seq_no = packet.seq_no.expect(
+                        "this packet to have been sent and therefore have a sequence number",
+                    );
 
-                let seq_no = packet
-                    .seq_no
-                    .expect("this packet to have been sent and therefore have a sequence number");
+                    // Piggy-back on regular resends.
+                    // We should never add padding as long as there are resends.
+                    assert!(self.resends.is_empty());
+                    self.resends.push_front(Resend {
+                        pt,
+                        ssrc: packet.meta.ssrc,
+                        seq_no,
+                        queued_at: now,
+                    });
 
-                // Piggy-back on regular resends.
-                // We should never add padding as long as there are resends.
-                assert!(self.resends.is_empty());
-                self.resends.push_front(Resend {
-                    pt,
-                    ssrc: packet.meta.ssrc,
-                    seq_no,
-                    queued_at: now,
-                });
-
-                return self.poll_packet_resend(now, true);
+                    return self.poll_packet_resend(now, true);
+                }
             }
         }
 
@@ -996,10 +996,11 @@ impl MediaInner {
         pt: Pt,
         rid: Option<Rid>,
         codec: Codec,
+        hold_back: usize,
     ) -> &mut DepacketizingBuffer {
         self.buffers_rx
             .entry((pt, rid))
-            .or_insert_with(|| DepacketizingBuffer::new(codec.into(), 30))
+            .or_insert_with(|| DepacketizingBuffer::new(codec.into(), hold_back))
     }
 
     pub fn poll_keyframe_request(&mut self) -> Option<(Option<Rid>, KeyframeRequestKind)> {
@@ -1017,12 +1018,12 @@ impl MediaInner {
                         rid: *rid,
                         params: codec,
                         time: dep.time,
-                        network_time: dep.meta[0].received,
+                        network_time: dep.network_time(),
+                        seq_range: dep.seq_range(),
                         contiguous: dep.contiguous,
-                        data: dep.data,
-                        ext_vals: dep.meta[0].header.ext_vals,
-                        meta: dep.meta,
+                        ext_vals: dep.ext_vals(),
                         codec_extra: dep.codec_extra,
+                        data: dep.data,
                     })
                     .map_err(|e| RtcError::Packet(self.mid, *pt, e)),
                 );
@@ -1128,7 +1129,7 @@ impl MediaInner {
         let state = QueueState {
             mid: self.mid,
             is_audio: self.kind.is_audio(),
-            use_for_padding: self.kind.is_video() && self.has_tx_rtx(),
+            use_for_padding: self.kind.is_video() && self.has_tx_rtx() && snapshot.has_ever_sent(),
             snapshot,
         };
 

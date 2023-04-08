@@ -253,49 +253,62 @@ impl RtpHeader {
     /// The logic detects wrap-arounds of the 16-bit RTP sequence number.
     #[doc(hidden)]
     pub fn sequence_number(&self, previous: Option<SeqNo>) -> SeqNo {
-        let e_seq = extend_seq(previous.map(|v| *v), self.sequence_number);
+        let e_seq = extend_u16(previous.map(|v| *v), self.sequence_number);
         e_seq.into()
     }
 }
 
-/// "extend" a 16 bit sequence number into a 64 bit by
-/// using the knowledge of the previous such sequence number.
-pub fn extend_seq(prev_ext_seq: Option<u64>, seq: u16) -> u64 {
-    // We define the index of the SRTP packet corresponding to a given
-    // ROC and RTP sequence number to be the 48-bit quantity
-    //       i = 2^16 * ROC + SEQ.
-    //
-    // https://tools.ietf.org/html/rfc3711#appendix-A
-    //
-    let seq = seq as u64;
+macro_rules! mk_extend {
+    ($id:ident, $t:ty) => {
+        /// "extend" a less than 64 bit sequence number into a 64 bit by
+        /// using the knowledge of the previous such sequence number.
+        pub fn $id(prev_ext_seq: Option<u64>, seq: $t) -> u64 {
+            use std::mem;
+            const MAX: u64 = <$t>::MAX as u64 + 1; // u16: 65_536;
+            const HALF: u64 = MAX / 2; // u16: 32_768
+            const BITS: usize = mem::size_of::<$t>() * 8;
+            const ROC_MASK: i64 = (u64::MAX >> BITS) as i64;
 
-    if prev_ext_seq.is_none() {
-        // No wrap-around so far.
-        return seq;
-    }
+            // We define the index of the SRTP packet corresponding to a given
+            // ROC and RTP sequence number to be the 48-bit quantity
+            //       i = 2^16 * ROC + SEQ.
+            //
+            // https://tools.ietf.org/html/rfc3711#appendix-A
+            //
+            let seq = seq as u64;
 
-    let prev_index = prev_ext_seq.unwrap();
-    let roc = (prev_index >> 16) as i64; // how many wrap-arounds.
-    let prev_seq = prev_index & 0xffff;
+            if prev_ext_seq.is_none() {
+                // No wrap-around so far.
+                return seq;
+            }
 
-    let v = if prev_seq < 32_768 {
-        if seq > 32_768 + prev_seq {
-            (roc - 1) & 0xffff_ffff
-        } else {
-            roc
+            let prev_index = prev_ext_seq.unwrap();
+            let roc = (prev_index >> BITS) as i64; // how many wrap-arounds.
+            let prev_seq = prev_index & (MAX - 1); // u16: 0xffff
+
+            let v = if prev_seq < HALF {
+                if seq > HALF + prev_seq {
+                    (roc - 1) & ROC_MASK
+                } else {
+                    roc
+                }
+            } else if prev_seq > seq + HALF {
+                (roc + 1) & ROC_MASK
+            } else {
+                roc
+            };
+
+            if v < 0 {
+                return 0;
+            }
+
+            (v as u64) * MAX + seq
         }
-    } else if prev_seq > seq + 32_768 {
-        (roc + 1) & 0xffff_ffff
-    } else {
-        roc
     };
-
-    if v < 0 {
-        return 0;
-    }
-
-    (v as u64) * 65_536 + seq
 }
+
+mk_extend!(extend_u16, u16);
+mk_extend!(extend_u32, u32);
 
 impl Default for RtpHeader {
     fn default() -> Self {
@@ -319,20 +332,49 @@ mod test {
     use super::*;
 
     #[test]
-    fn extend_seq_wrap_around() {
-        assert_eq!(extend_seq(None, 0), 0);
-        assert_eq!(extend_seq(Some(0), 1), 1);
-        assert_eq!(extend_seq(Some(65_535), 0), 65_536);
-        assert_eq!(extend_seq(Some(65_500), 2), 65_538);
-        assert_eq!(extend_seq(Some(2), 1), 1);
-        assert_eq!(extend_seq(Some(65_538), 1), 65_537);
-        assert_eq!(extend_seq(Some(3), 3), 3);
-        assert_eq!(extend_seq(Some(65_500), 65_500), 65_500);
+    fn extend_u16_wrap_around() {
+        assert_eq!(extend_u16(None, 0), 0);
+        assert_eq!(extend_u16(Some(0), 1), 1);
+        assert_eq!(extend_u16(Some(65_535), 0), 65_536);
+        assert_eq!(extend_u16(Some(65_500), 2), 65_538);
+        assert_eq!(extend_u16(Some(2), 1), 1);
+        assert_eq!(extend_u16(Some(65_538), 1), 65_537);
+        assert_eq!(extend_u16(Some(3), 3), 3);
+        assert_eq!(extend_u16(Some(65_500), 65_500), 65_500);
     }
 
     #[test]
-    fn extend_33k_with_0_prev() {
-        assert_eq!(extend_seq(Some(0), 33_000), 281474976678120);
+    fn extend_u16_with_0_prev() {
+        // This tests going backwards from previous 0. This should wrap
+        // around "backwards" making a ridiculous number.
+        let seq = u16::MAX / 2 + 2;
+        let expected = u64::MAX - (u16::MAX - seq) as u64;
+        assert_eq!(extend_u16(Some(0), seq), expected);
+    }
+
+    #[test]
+    fn extend_u32_wrap_around() {
+        const U32MAX: u64 = u32::MAX as u64 + 1;
+        assert_eq!(extend_u32(None, 0), 0);
+        assert_eq!(extend_u32(Some(0), 1), 1);
+        assert_eq!(extend_u32(Some(U32MAX - 1), 0), U32MAX);
+        assert_eq!(extend_u32(Some(U32MAX - 32), 2), U32MAX + 2);
+        assert_eq!(extend_u32(Some(2), 1), 1);
+        assert_eq!(extend_u32(Some(U32MAX + 2), 1), U32MAX + 1);
+        assert_eq!(extend_u32(Some(3), 3), 3);
+        assert_eq!(
+            extend_u32(Some(U32MAX - 32), (U32MAX - 32) as u32),
+            U32MAX - 32
+        );
+    }
+
+    #[test]
+    fn extend_u32_with_0_prev() {
+        // This tests going backwards from previous 0. This should wrap
+        // around "backwards" making a ridiculous number.
+        let seq = u32::MAX / 2 + 2;
+        let expected = u64::MAX - (u32::MAX - seq) as u64;
+        assert_eq!(extend_u32(Some(0), seq), expected);
     }
 
     #[test]

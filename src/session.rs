@@ -8,8 +8,8 @@ use crate::media::{MediaAdded, MediaChanged, Source};
 use crate::packet::{
     LeakyBucketPacer, NullPacer, Pacer, PacerImpl, PollOutcome, RtpMeta, SendSideBandwithEstimator,
 };
-use crate::rtp::SRTCP_OVERHEAD;
-use crate::rtp::{extend_seq, RtpHeader, SessionId, TwccRecvRegister, TwccSendRegister};
+use crate::rtp::{extend_u16, RtpHeader, SessionId, TwccRecvRegister, TwccSendRegister};
+use crate::rtp::{extend_u32, SRTCP_OVERHEAD};
 use crate::rtp::{Bitrate, ExtensionMap, MediaTime, Mid, Rtcp, RtcpFb};
 use crate::rtp::{SrtpContext, SrtpKey, Ssrc};
 use crate::stats::StatsSnapshot;
@@ -27,8 +27,8 @@ const NACK_MIN_INTERVAL: Duration = Duration::from_millis(100);
 // Delay between reports of TWCC. This is deliberately very low.
 const TWCC_INTERVAL: Duration = Duration::from_millis(100);
 
-const PACING_FACTOR: f64 = 2.5;
-const PADDING_FACTOR: f64 = 1.00;
+const PACING_FACTOR: f64 = 1.1;
+const PADDING_FACTOR: f64 = 1.0;
 
 pub(crate) struct Session {
     id: SessionId,
@@ -40,6 +40,9 @@ pub(crate) struct Session {
 
     /// The app m-line. Spliced into medias above.
     app: Option<(Mid, usize)>,
+
+    reordering_size_audio: usize,
+    reordering_size_video: usize,
 
     /// Extension mappings are _per BUNDLE_, but we can only have one a=group BUNDLE
     /// in WebRTC (one ice connection), so they are effectively per session.
@@ -68,8 +71,7 @@ pub(crate) struct Session {
     twcc_rx_register: TwccRecvRegister,
     twcc_tx_register: TwccSendRegister,
 
-    bwe: Option<SendSideBandwithEstimator>,
-    bwe_desired_bitrate: Bitrate,
+    bwe: Option<Bwe>,
 
     enable_twcc_feedback: bool,
 
@@ -106,7 +108,12 @@ impl Session {
                 Duration::from_millis(40),
             ));
 
-            let bwe = SendSideBandwithEstimator::new(rate);
+            let send_side_bwe = SendSideBandwithEstimator::new(rate);
+            let bwe = Bwe {
+                bwe: send_side_bwe,
+                desired_bitrate: Bitrate::ZERO,
+                current_bitrate: rate,
+            };
 
             (pacer, Some(bwe))
         } else {
@@ -117,6 +124,8 @@ impl Session {
             id,
             medias: vec![],
             app: None,
+            reordering_size_audio: config.reordering_size_audio,
+            reordering_size_video: config.reordering_size_video,
             exts: config.exts,
             codec_config: config.codec_config.clone(),
             source_keys: HashMap::new(),
@@ -131,7 +140,6 @@ impl Session {
             twcc_rx_register: TwccRecvRegister::new(100),
             twcc_tx_register: TwccSendRegister::new(1000),
             bwe,
-            bwe_desired_bitrate: Bitrate::ZERO,
             enable_twcc_feedback: false,
             pacer,
             poll_packet_buf: vec![0; 2000],
@@ -322,7 +330,7 @@ impl Session {
         trace!("Handle RTP: {:?}", header);
         if let Some(transport_cc) = header.ext_vals.transport_cc {
             let prev = self.twcc_rx_register.max_seq();
-            let extended = extend_seq(Some(*prev), transport_cc);
+            let extended = extend_u16(Some(*prev), transport_cc);
             self.twcc_rx_register.update_seq(extended.into(), now);
         }
 
@@ -476,15 +484,22 @@ impl Session {
         let pt = params.pt();
         let codec = params.spec().codec;
 
-        let time = MediaTime::new(header.timestamp as i64, clock_rate as i64);
-
         if !media.direction().is_receiving() {
             // Not adding unless we are supposed to be receiving.
             return;
         }
 
         // Buffers are unique per media (since PT is unique per media).
-        let buf = media.get_buffer_rx(pt, rid, codec);
+        let hold_back = if codec.is_audio() {
+            self.reordering_size_audio
+        } else {
+            self.reordering_size_video
+        };
+        let buf = media.get_buffer_rx(pt, rid, codec, hold_back);
+
+        let prev_time = buf.max_time().map(|t| t.numer() as u64);
+        let extended = extend_u32(prev_time, header.timestamp);
+        let time = MediaTime::new(extended as i64, clock_rate as i64);
 
         let meta = RtpMeta::new(now, time, seq_no, header);
 
@@ -519,7 +534,7 @@ impl Session {
                 }
                 // Not in the above if due to lifetime issues, still okay because the method
                 // doesn't do anything when BWE isn't configured.
-                self.configure_pacer_padding();
+                self.configure_pacer();
 
                 return Some(());
             }
@@ -834,14 +849,17 @@ impl Session {
     }
 
     pub fn set_bwe_current_bitrate(&mut self, current_bitrate: Bitrate) {
-        let pacing_rate = current_bitrate * PACING_FACTOR;
-
-        self.pacer.set_pacing_rate(pacing_rate);
+        if let Some(bwe) = self.bwe.as_mut() {
+            bwe.current_bitrate = current_bitrate;
+            self.configure_pacer();
+        }
     }
 
     pub fn set_bwe_desired_bitrate(&mut self, desired_bitrate: Bitrate) {
-        self.bwe_desired_bitrate = desired_bitrate;
-        self.configure_pacer_padding();
+        if let Some(bwe) = self.bwe.as_mut() {
+            bwe.desired_bitrate = desired_bitrate;
+            self.configure_pacer();
+        }
     }
 
     pub fn line_count(&self) -> usize {
@@ -856,16 +874,57 @@ impl Session {
         &self.medias
     }
 
-    fn configure_pacer_padding(&mut self) {
+    fn configure_pacer(&mut self) {
         let Some(bwe) = self.bwe.as_ref() else {
             return;
         };
 
         let padding_rate = bwe
             .last_estimate()
-            .map(|bwe| (bwe * PADDING_FACTOR).min(self.bwe_desired_bitrate))
+            .map(|estimate| (estimate * PADDING_FACTOR).min(bwe.desired_bitrate))
             .unwrap_or(Bitrate::ZERO);
 
         self.pacer.set_padding_rate(padding_rate);
+
+        // We pad up to the pacing rate, therefore we need to increase pacing if the estimate, and
+        // thus the padding rate, exceeds the current bitrate adjusted with the pacing factor.
+        // Otherwise we can have a case where the current bitrate is 250Kbit/s resulting in a
+        // pacing rate of 275KBit/s which means we'll only ever pad about 25Kbit/s. If the estimate
+        // is actually 600Kbit/s we need to use that for the pacing rate to ensure we send as much as
+        // we think the link capacity can sustain, if not the estimate is a lie.
+        let pacing_rate = (bwe.current_bitrate * PACING_FACTOR).max(padding_rate);
+        self.pacer.set_pacing_rate(pacing_rate);
+    }
+}
+
+struct Bwe {
+    bwe: SendSideBandwithEstimator,
+    desired_bitrate: Bitrate,
+    current_bitrate: Bitrate,
+}
+
+impl Bwe {
+    fn handle_timeout(&mut self, now: Instant) {
+        self.bwe.handle_timeout(now);
+    }
+
+    pub(crate) fn update<'t>(
+        &mut self,
+        records: impl Iterator<Item = &'t crate::rtp::TwccSendRecord>,
+        now: Instant,
+    ) {
+        self.bwe.update(records, now);
+    }
+
+    fn poll_estimate(&mut self) -> Option<Bitrate> {
+        self.bwe.poll_estimate()
+    }
+
+    fn poll_timeout(&self) -> Instant {
+        self.bwe.poll_timeout()
+    }
+
+    fn last_estimate(&self) -> Option<Bitrate> {
+        self.bwe.last_estimate()
     }
 }

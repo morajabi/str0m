@@ -1,8 +1,9 @@
 use std::collections::VecDeque;
 use std::fmt;
+use std::ops::RangeInclusive;
 use std::time::Instant;
 
-use crate::rtp::{MediaTime, RtpHeader, SeqNo};
+use crate::rtp::{ExtensionValues, MediaTime, RtpHeader, SeqNo};
 
 use super::{CodecDepacketizer, CodecExtra, Depacketizer, PacketError};
 
@@ -26,6 +27,22 @@ pub struct Depacketized {
     pub meta: Vec<RtpMeta>,
     pub data: Vec<u8>,
     pub codec_extra: CodecExtra,
+}
+
+impl Depacketized {
+    pub fn network_time(&self) -> Instant {
+        self.meta[0].received
+    }
+
+    pub fn seq_range(&self) -> RangeInclusive<SeqNo> {
+        let first = self.meta[0].seq_no;
+        let last = self.meta.last().expect("at least one element").seq_no;
+        first..=last
+    }
+
+    pub fn ext_vals(&self) -> ExtensionValues {
+        self.meta[0].header.ext_vals
+    }
 }
 
 #[derive(Debug)]
@@ -55,6 +72,7 @@ pub struct DepacketizingBuffer {
     queue: VecDeque<Entry>,
     segments: Vec<(usize, usize)>,
     last_emitted: Option<SeqNo>,
+    max_time: Option<MediaTime>,
 }
 
 impl DepacketizingBuffer {
@@ -65,18 +83,29 @@ impl DepacketizingBuffer {
             queue: VecDeque::new(),
             segments: Vec::new(),
             last_emitted: None,
+            max_time: None,
         }
     }
 
     pub fn push(&mut self, meta: RtpMeta, data: Vec<u8>) {
         // We're not emitting samples in the wrong order. If we receive
         // packets that are before the last emitted, we drop.
+        //
+        // As a special case, per popular demand, if hold_back is 0, we do emit
+        // out of order packets.
         if let Some(last) = self.last_emitted {
-            if meta.seq_no <= last {
+            if meta.seq_no <= last && self.hold_back > 0 {
                 trace!("Drop before emitted: {} <= {}", meta.seq_no, last);
                 return;
             }
         }
+
+        // Record that latest seen max time (used for extending time to u64).
+        self.max_time = Some(if let Some(m) = self.max_time {
+            m.max(meta.time)
+        } else {
+            meta.time
+        });
 
         match self
             .queue
@@ -240,6 +269,10 @@ impl DepacketizingBuffer {
 
         seq.is_next(start_entry.meta.seq_no)
     }
+
+    pub fn max_time(&self) -> Option<MediaTime> {
+        self.max_time
+    }
 }
 
 impl fmt::Debug for RtpMeta {
@@ -350,6 +383,26 @@ mod test {
         ])
     }
 
+    #[test]
+    fn packets_with_hold_0() {
+        test0(&[
+            (1, 1, &[1, 9], &[(1, &[1, 9])]),
+            (3, 3, &[1, 9], &[(3, &[1, 9])]),
+            (4, 4, &[1, 9], &[(4, &[1, 9])]),
+            (5, 5, &[1, 9], &[(5, &[1, 9])]),
+        ])
+    }
+
+    #[test]
+    fn out_of_order_packets_with_hold_0() {
+        test0(&[
+            (3, 1, &[1, 9], &[(1, &[1, 9])]),
+            (1, 3, &[1, 9], &[(3, &[1, 9])]),
+            (5, 4, &[1, 9], &[(4, &[1, 9])]),
+            (2, 5, &[1, 9], &[(5, &[1, 9])]),
+        ])
+    }
+
     fn test(
         v: &[(
             u64,   // seq
@@ -361,8 +414,37 @@ mod test {
             )],
         )],
     ) {
+        test_n(3, v)
+    }
+
+    fn test0(
+        v: &[(
+            u64,   // seq
+            i64,   // time
+            &[u8], // data
+            &[(
+                i64,   // time
+                &[u8], // depacketized data
+            )],
+        )],
+    ) {
+        test_n(0, v)
+    }
+
+    fn test_n(
+        hold_back: usize,
+        v: &[(
+            u64,   // seq
+            i64,   // time
+            &[u8], // data
+            &[(
+                i64,   // time
+                &[u8], // depacketized data
+            )],
+        )],
+    ) {
         let depack = CodecDepacketizer::Boxed(Box::new(TestDepack));
-        let mut buf = DepacketizingBuffer::new(depack, 3);
+        let mut buf = DepacketizingBuffer::new(depack, hold_back);
 
         let mut step = 1;
 

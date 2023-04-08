@@ -1,11 +1,11 @@
+use std::ops::RangeInclusive;
 use std::time::Instant;
 
-use crate::rtp::{Direction, ExtensionValues, MediaTime, Mid, Pt, Rid};
+use crate::rtp::{Direction, ExtensionValues, MediaTime, Mid, Pt, Rid, SeqNo};
 use crate::sdp::Simulcast as SdpSimulcast;
 
 use super::PayloadParams;
 use crate::format::CodecExtra;
-use crate::media::rtp::RtpMeta;
 
 pub use crate::packet::MediaKind;
 
@@ -113,6 +113,9 @@ pub struct MediaData {
     /// In simple SFU setups this can be used as wallclock for [`Writer::write`][crate::media::Writer].
     pub network_time: Instant,
 
+    /// The (RTP) sequence numbers that made up this data.
+    pub seq_range: RangeInclusive<SeqNo>,
+
     /// Whether the data is contiguous from the one just previously emitted. If this is false,
     /// we got an interruption in RTP packets, and the data may or may not be usable in a decoder
     /// without requesting a new keyframe.
@@ -131,9 +134,6 @@ pub struct MediaData {
     /// RTP header extensions for this media data. This is taken from the
     /// first RTP header.
     pub ext_vals: ExtensionValues,
-
-    /// The individual packet metadata that were part of making the Sample in `data`.
-    pub meta: Vec<RtpMeta>,
 
     /// Additional codec specific information
     pub codec_extra: CodecExtra,
