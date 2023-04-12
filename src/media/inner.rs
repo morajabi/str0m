@@ -3,7 +3,6 @@ use std::time::{Duration, Instant};
 
 use crate::change::AddMedia;
 use crate::format::Codec;
-pub use crate::packet::RtpMeta;
 pub use crate::rtp::{Direction, ExtensionValues, MediaTime, Mid, Pt, Rid, Ssrc};
 
 use crate::io::{Id, DATAGRAM_MTU};
@@ -32,9 +31,6 @@ pub(crate) trait Source {
     #[must_use]
     fn set_repairs(&mut self, ssrc: Ssrc) -> bool;
 }
-
-// How often we remove unused senders/receivers.
-const CLEANUP_INTERVAL: Duration = Duration::from_secs(10);
 
 // Time between regular receiver reports.
 // https://www.rfc-editor.org/rfc/rfc8829#section-5.1.2
@@ -103,9 +99,6 @@ pub(crate) struct MediaInner {
     /// Created when we configure new media via Changes API.
     sources_tx: Vec<SenderSource>,
 
-    /// Last time we ran cleanup.
-    last_cleanup: Instant,
-
     /// Last time we produced regular feedback (SR/RR).
     last_regular_feedback: Instant,
 
@@ -156,6 +149,22 @@ pub(crate) struct MediaInner {
 
     /// Merged queue state, set to None if we need to recalculate it.
     queue_state: Option<QueueState>,
+
+    /// Enqueing to the PacketizingBuffer requires a "queued_at" field
+    /// which is "now". We don't want write() to drive time forward,
+    /// which means we are temporarily storing the packets here until
+    /// next handle_timeout.
+    ///
+    /// The expected behavior is:
+    /// 1. MediaWriter::write()
+    /// 2. to_packetize.push()
+    /// 3. poll_output -> timeout straight away
+    /// 4. handle_timeout(straight away)
+    /// 5. to_packetize.pop()
+    to_packetize: VecDeque<ToPacketize>,
+
+    /// Whether we are running in RTP-mode.
+    pub(crate) rtp_mode: bool,
 }
 
 struct NextPacket<'a> {
@@ -163,6 +172,14 @@ struct NextPacket<'a> {
     ssrc: Ssrc,
     seq_no: SeqNo,
     body: NextPacketBody<'a>,
+}
+
+#[derive(Debug)]
+struct ToPacketize {
+    pt: Pt,
+    data: Vec<u8>,
+    meta: PacketizedMeta,
+    rtp_mode_header: Option<RtpHeader>,
 }
 
 enum NextPacketBody<'a> {
@@ -221,7 +238,7 @@ impl MediaInner {
         self.dir
     }
 
-    fn codec_by_pt(&self, pt: Pt) -> Option<&PayloadParams> {
+    fn params_by_pt(&self, pt: Pt) -> Option<&PayloadParams> {
         self.params.iter().find(|c| c.pt() == pt)
     }
 
@@ -239,21 +256,31 @@ impl MediaInner {
     #[allow(clippy::too_many_arguments)]
     pub fn write(
         &mut self,
-        now: Instant,
         pt: Pt,
         wallclock: Instant,
         rtp_time: MediaTime,
         data: &[u8],
         rid: Option<Rid>,
         ext_vals: ExtensionValues,
-    ) -> Result<usize, RtcError> {
+        rtp_mode_header: Option<RtpHeader>,
+    ) -> Result<(), RtcError> {
         if !self.dir.is_sending() {
             return Err(RtcError::NotSendingDirection(self.dir));
         }
 
-        let Some(spec) = self.codec_by_pt(pt).map(|p| p.spec()) else {
+        let Some(spec) = self.params_by_pt(pt).map(|p| p.spec()) else {
             return Err(RtcError::UnknownPt(pt));
         };
+
+        // Implicitly if we have an rtp mode header, the codec must be Null.
+        let codec = if rtp_mode_header.is_some() {
+            Codec::Null
+        } else {
+            spec.codec
+        };
+
+        // Never want to check this for the null codec.
+        let is_audio = spec.codec.is_audio();
 
         // The SSRC is figured out given the simulcast level.
         let tx = get_source_tx(&mut self.sources_tx, rid, false).ok_or(RtcError::NoSenderSource)?;
@@ -261,9 +288,11 @@ impl MediaInner {
         let ssrc = tx.ssrc();
         tx.update_clocks(rtp_time, wallclock);
 
-        let buf = self.buffers_tx.entry(pt).or_insert_with(|| {
-            let max_retain = if spec.codec.is_audio() { 4096 } else { 2048 };
-            PacketizingBuffer::new(spec.codec.into(), max_retain)
+        // We don't actually want this buffer here, but it must be created before we
+        // get to the do_packetize() (as part of handle_timeout).
+        let _ = self.buffers_tx.entry(pt).or_insert_with(|| {
+            let max_retain = if is_audio { 4096 } else { 2048 };
+            PacketizingBuffer::new(codec.into(), max_retain)
         });
 
         trace!(
@@ -271,26 +300,82 @@ impl MediaInner {
             rtp_time,
             data.len()
         );
-        let mut mtu: usize = DATAGRAM_MTU - SRTP_OVERHEAD;
-        // align to SRTP block size to minimize padding needs
-        mtu = mtu - mtu % SRTP_BLOCK_SIZE;
 
         let meta = PacketizedMeta {
             rtp_time,
             ssrc,
             rid,
             ext_vals,
-            queued_at: now,
         };
 
-        // Invalidate cached queue_state.
-        self.queue_state = None;
+        self.to_packetize.push_back(ToPacketize {
+            pt,
+            data: data.to_vec(),
+            meta,
+            rtp_mode_header,
+        });
 
-        if let Err(e) = buf.push_sample(data, meta, mtu) {
-            return Err(RtcError::Packet(self.mid, pt, e));
+        Ok(())
+    }
+
+    /// Does the actual packetizing on handle_timeout()
+    fn do_packetize(&mut self, now: Instant) -> Result<(), RtcError> {
+        const RTP_SIZE: usize = DATAGRAM_MTU - SRTP_OVERHEAD;
+        // align to SRTP block size to minimize padding needs
+        const MTU: usize = RTP_SIZE - RTP_SIZE % SRTP_BLOCK_SIZE;
+
+        while let Some(t) = self.to_packetize.pop_front() {
+            let buf = self
+                .buffers_tx
+                .get_mut(&t.pt)
+                .expect("write() to create buffer");
+
+            if self.rtp_mode {
+                let rtp_header = t.rtp_mode_header.expect("rtp header in rtp mode");
+                buf.push_rtp_packet(now, t.data, t.meta, rtp_header);
+            } else if let Err(e) = buf.push_sample(now, &t.data, t.meta, MTU) {
+                return Err(RtcError::Packet(self.mid, t.pt, e));
+            }
+
+            // Invalidate cached queue_state.
+            self.queue_state = None;
+        }
+
+        Ok(())
+    }
+
+    pub(crate) fn write_rtp(
+        &mut self,
+        pt: Pt,
+        wallclock: Instant,
+        packet: &[u8],
+        exts: &ExtensionMap,
+    ) -> Result<(), RtcError> {
+        let Some(spec) = self.params_by_pt(pt).map(|p| p.spec()) else {
+            return Err(RtcError::UnknownPt(pt));
         };
 
-        Ok(buf.free())
+        let header = RtpHeader::parse(packet, exts)
+            .ok_or_else(|| RtcError::Other("Failed to parse RTP header".into()))?;
+
+        // Remove header from packet.
+        let packet = &packet[header.header_len..];
+
+        let rid = header.ext_vals.rid;
+        // This doesn't need to be lengthened
+        let rtp_time = MediaTime::new(header.timestamp as i64, spec.clock_rate as i64);
+
+        self.write(
+            pt,
+            wallclock,
+            rtp_time,
+            packet,
+            rid,
+            header.ext_vals,
+            Some(header),
+        )?;
+
+        Ok(())
     }
 
     pub fn is_request_keyframe_possible(&self, kind: KeyframeRequestKind) -> bool {
@@ -436,16 +521,8 @@ impl MediaInner {
 
         // If we hit the cap, stop doing resends by clearing those we have queued.
         if ratio > 0.15_f32 {
-            for resend in self.resends.drain(..) {
-                let Some(buffer) = self
-                    .buffers_tx
-                    .values_mut()
-                    .find(|p| p.has_ssrc(resend.ssrc)) else {
-                        continue;
-                    };
-                // Unmark the resend so they don't count as queued anymore.
-                let _ = buffer.get_and_unmark_as_accounted(now, resend.seq_no);
-            }
+            self.resends.clear();
+
             // Invalidate cached queue state.
             self.queue_state = None;
 
@@ -482,12 +559,8 @@ impl MediaInner {
             break (resend, source);
         };
 
-        // get_and_mark_as_unaccounted() requires a mut reference to buffer, which we can't do in the
-        // above loop (waiting for polonius). The solution is to look the buffer up again after the loop.
         let buffer = self.buffers_tx.get_mut(&resend.pt).unwrap();
-        let pkt = buffer
-            .get_and_unmark_as_accounted(now, resend.seq_no)
-            .unwrap();
+        let pkt = buffer.get(resend.seq_no).unwrap();
 
         // Force recaching since packetizer changed.
         self.queue_state = None;
@@ -497,7 +570,7 @@ impl MediaInner {
             self.bytes_retransmitted.push(now, pkt.data.len() as u64);
         }
 
-        let seq_no = source.next_seq_no(now);
+        let seq_no = source.next_seq_no(now, None);
 
         // The resend ssrc. This would correspond to the RTX PT for video.
         let ssrc_rtx = source.ssrc();
@@ -535,7 +608,10 @@ impl MediaInner {
         source.update_packet_counts(pkt.data.len() as u64, false);
         self.bytes_transmitted.push(now, pkt.data.len() as u64);
 
-        let seq_no = source.next_seq_no(now);
+        //  In rtp_mode, we just use the incoming sequence number.
+        let wanted = pkt.rtp_mode_header.as_ref().map(|h| h.sequence_number);
+
+        let seq_no = source.next_seq_no(now, wanted);
         pkt.seq_no = Some(seq_no);
 
         Some(NextPacket {
@@ -591,6 +667,7 @@ impl MediaInner {
                         pt,
                         ssrc: packet.meta.ssrc,
                         seq_no,
+                        body_size: packet.data.len(),
                         queued_at: now,
                     });
 
@@ -614,7 +691,9 @@ impl MediaInner {
 
             let padding = pad_size.max(MAX_PADDING_PACKET_SIZE);
 
-            let seq_no = self.get_or_create_source_tx(ssrc_rtx).next_seq_no(now);
+            let seq_no = self
+                .get_or_create_source_tx(ssrc_rtx)
+                .next_seq_no(now, None);
 
             Some(NextPacket {
                 pt: pt_rtx,
@@ -720,17 +799,21 @@ impl MediaInner {
             .any(|s| s.has_nack())
     }
 
-    pub fn handle_timeout(&mut self, now: Instant) {
-        // TODO(martin): more cleanup
-        self.last_cleanup = now;
+    pub fn handle_timeout(&mut self, now: Instant) -> Result<(), RtcError> {
+        self.do_packetize(now)
     }
 
     pub fn poll_timeout(&mut self) -> Option<Instant> {
-        Some(self.cleanup_at())
+        self.packetize_at()
     }
 
-    fn cleanup_at(&self) -> Instant {
-        self.last_cleanup + CLEANUP_INTERVAL
+    fn packetize_at(&self) -> Option<Instant> {
+        if self.to_packetize.is_empty() {
+            None
+        } else {
+            // If we got things to packetize, do it straight away.
+            Some(already_happened())
+        }
     }
 
     pub fn source_tx_ssrcs(&self) -> impl Iterator<Item = Ssrc> + '_ {
@@ -967,7 +1050,7 @@ impl MediaInner {
         for p_new in pts {
             new_pts.insert(*p_new);
 
-            if self.codec_by_pt(*p_new).is_none() {
+            if self.params_by_pt(*p_new).is_none() {
                 debug!("Ignoring new pt ({}) in mid: {}", p_new, self.mid);
             }
         }
@@ -1053,12 +1136,15 @@ impl MediaInner {
         for seq_no in iter {
             // This keeps the TotalQueue updated in the buffer so the QueueState will
             // account for resends.
-            buffer.mark_as_unaccounted(now, seq_no);
+            let Some(pkt) = buffer.get(seq_no) else {
+                continue;
+            };
 
             let resend = Resend {
                 ssrc,
                 pt: *pt,
                 seq_no,
+                body_size: pkt.data.len(),
                 queued_at: now,
             };
             self.resends.push_back(resend);
@@ -1120,11 +1206,23 @@ impl MediaInner {
         }
 
         let init = QueueSnapshot::default();
-        let snapshot = self.buffers_tx.values_mut().fold(init, |mut snap, b| {
+        let mut snapshot = self.buffers_tx.values_mut().fold(init, |mut snap, b| {
             snap.merge(&b.queue_snapshot(now));
 
             snap
         });
+
+        for resend in &self.resends {
+            let queued = now - resend.queued_at;
+            let snap = QueueSnapshot {
+                created_at: now,
+                size: resend.body_size,
+                packet_count: 1,
+                total_queue_time_origin: queued,
+                ..Default::default()
+            };
+            snapshot.merge(&snap);
+        }
 
         let state = QueueState {
             mid: self.mid,
@@ -1204,6 +1302,7 @@ struct Resend {
     pub ssrc: Ssrc,
     pub pt: Pt,
     pub seq_no: SeqNo,
+    pub body_size: usize,
     pub queued_at: Instant,
 }
 
@@ -1237,7 +1336,6 @@ impl Default for MediaInner {
             params: vec![],
             sources_rx: vec![],
             sources_tx: vec![],
-            last_cleanup: already_happened(),
             last_regular_feedback: already_happened(),
             buffers_rx: HashMap::new(),
             buffers_tx: HashMap::new(),
@@ -1252,6 +1350,8 @@ impl Default for MediaInner {
             bytes_transmitted: ValueHistory::new(0, Duration::from_secs(2)),
             bytes_retransmitted: ValueHistory::new(0, Duration::from_secs(2)),
             queue_state: None,
+            to_packetize: VecDeque::default(),
+            rtp_mode: false,
         }
     }
 }

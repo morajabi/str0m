@@ -26,18 +26,21 @@ use vp8::{Vp8Depacketizer, Vp8Packetizer};
 mod vp9;
 use vp9::{Vp9Depacketizer, Vp9Packetizer};
 
+mod null;
+use null::{NullDepacketizer, NullPacketizer};
+
 mod buffer_rx;
-pub use buffer_rx::{Depacketized, DepacketizingBuffer, RtpMeta};
+pub(crate) use buffer_rx::{Depacketized, DepacketizingBuffer, RtpMeta};
 
 mod buffer_tx;
-pub use buffer_tx::{Packetized, PacketizedMeta, PacketizingBuffer};
+pub(crate) use buffer_tx::{Packetized, PacketizedMeta, PacketizingBuffer};
 
 mod bwe;
-pub use bwe::SendSideBandwithEstimator;
+pub(crate) use bwe::SendSideBandwithEstimator;
 
 mod pacer;
-pub use pacer::{LeakyBucketPacer, NullPacer, Pacer, PacerImpl, PollOutcome};
-pub use pacer::{QueueSnapshot, QueueState};
+pub(crate) use pacer::{LeakyBucketPacer, NullPacer, Pacer, PacerImpl, PollOutcome};
+pub(crate) use pacer::{QueueSnapshot, QueueState};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 /// Types of media.
@@ -61,7 +64,7 @@ impl MediaKind {
 }
 
 /// Packetizes some bytes for use as RTP packet.
-pub trait Packetizer: fmt::Debug {
+pub(crate) trait Packetizer: fmt::Debug {
     /// Chunk the data up into RTP packets.
     fn packetize(&mut self, mtu: usize, b: &[u8]) -> Result<Vec<Vec<u8>>, PacketError>;
 
@@ -83,7 +86,7 @@ pub enum CodecExtra {
 /// Depacketizes an RTP payload.
 ///
 /// Removes any RTP specific data from the payload.
-pub trait Depacketizer: fmt::Debug {
+pub(crate) trait Depacketizer: fmt::Debug {
     /// Unpack the RTP packet into a provided `Vec<u8>`.
     fn depacketize(
         &mut self,
@@ -162,7 +165,7 @@ impl BitRead for (&[u8], usize) {
 }
 
 #[derive(Debug)]
-pub enum CodecPacketizer {
+pub(crate) enum CodecPacketizer {
     G711(G711Packetizer),
     G722(G722Packetizer),
     H264(H264Packetizer),
@@ -170,16 +173,18 @@ pub enum CodecPacketizer {
     Opus(OpusPacketizer),
     Vp8(Vp8Packetizer),
     Vp9(Vp9Packetizer),
+    Null(NullPacketizer),
     Boxed(Box<dyn Packetizer + Send + Sync>),
 }
 
 #[derive(Debug)]
-pub enum CodecDepacketizer {
+pub(crate) enum CodecDepacketizer {
     H264(H264Depacketizer),
     H265(H265Depacketizer),
     Opus(OpusDepacketizer),
     Vp8(Vp8Depacketizer),
     Vp9(Vp9Depacketizer),
+    Null(NullDepacketizer),
     Boxed(Box<dyn Depacketizer + Send + Sync>),
 }
 
@@ -192,6 +197,7 @@ impl From<Codec> for CodecPacketizer {
             Codec::Vp8 => CodecPacketizer::Vp8(Vp8Packetizer::default()),
             Codec::Vp9 => CodecPacketizer::Vp9(Vp9Packetizer::default()),
             Codec::Av1 => unimplemented!("Missing packetizer for AV1"),
+            Codec::Null => CodecPacketizer::Null(NullPacketizer),
             Codec::Rtx => panic!("Cant instantiate packetizer for RTX codec"),
             Codec::Unknown => panic!("Cant instantiate packetizer for unknown codec"),
             _ => panic!("Cant instantiate packetizer for unhandled codec"),
@@ -208,6 +214,7 @@ impl From<Codec> for CodecDepacketizer {
             Codec::Vp8 => CodecDepacketizer::Vp8(Vp8Depacketizer::default()),
             Codec::Vp9 => CodecDepacketizer::Vp9(Vp9Depacketizer::default()),
             Codec::Av1 => unimplemented!("Missing depacketizer for AV1"),
+            Codec::Null => CodecDepacketizer::Null(NullDepacketizer),
             Codec::Rtx => panic!("Cant instantiate depacketizer for RTX codec"),
             Codec::Unknown => panic!("Cant instantiate depacketizer for unknown codec"),
             _ => panic!("Cant instantiate packetizer for unhandled codec"),
@@ -225,6 +232,7 @@ impl Packetizer for CodecPacketizer {
             Opus(v) => v.packetize(mtu, b),
             Vp8(v) => v.packetize(mtu, b),
             Vp9(v) => v.packetize(mtu, b),
+            Null(v) => v.packetize(mtu, b),
             Boxed(v) => v.packetize(mtu, b),
         }
     }
@@ -237,6 +245,7 @@ impl Packetizer for CodecPacketizer {
             CodecPacketizer::H264(v) => v.is_marker(data, previous, last),
             CodecPacketizer::Vp8(v) => v.is_marker(data, previous, last),
             CodecPacketizer::Vp9(v) => v.is_marker(data, previous, last),
+            CodecPacketizer::Null(v) => v.is_marker(data, previous, last),
             CodecPacketizer::Boxed(v) => v.is_marker(data, previous, last),
         }
     }
@@ -256,6 +265,7 @@ impl Depacketizer for CodecDepacketizer {
             Opus(v) => v.depacketize(packet, out, extra),
             Vp8(v) => v.depacketize(packet, out, extra),
             Vp9(v) => v.depacketize(packet, out, extra),
+            Null(v) => v.depacketize(packet, out, extra),
             Boxed(v) => v.depacketize(packet, out, extra),
         }
     }
@@ -268,6 +278,7 @@ impl Depacketizer for CodecDepacketizer {
             Opus(v) => v.is_partition_head(packet),
             Vp8(v) => v.is_partition_head(packet),
             Vp9(v) => v.is_partition_head(packet),
+            Null(v) => v.is_partition_head(packet),
             Boxed(v) => v.is_partition_head(packet),
         }
     }
@@ -280,6 +291,7 @@ impl Depacketizer for CodecDepacketizer {
             Opus(v) => v.is_partition_tail(marker, packet),
             Vp8(v) => v.is_partition_tail(marker, packet),
             Vp9(v) => v.is_partition_tail(marker, packet),
+            Null(v) => v.is_partition_tail(marker, packet),
             Boxed(v) => v.is_partition_tail(marker, packet),
         }
     }

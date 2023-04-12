@@ -2,7 +2,7 @@ use std::collections::{HashMap, VecDeque};
 use std::time::{Duration, Instant};
 
 use crate::dtls::KeyingMaterial;
-use crate::format::CodecConfig;
+use crate::format::{Codec, CodecConfig};
 use crate::io::{DatagramSend, DATAGRAM_MTU, DATAGRAM_MTU_WARN};
 use crate::media::{MediaAdded, MediaChanged, Source};
 use crate::packet::{
@@ -82,6 +82,9 @@ pub(crate) struct Session {
     poll_packet_buf: Vec<u8>,
 
     pub ice_lite: bool,
+
+    /// Whether we are running in RTP-mode.
+    rtp_mode: bool,
 }
 
 #[allow(clippy::large_enum_variant)]
@@ -144,6 +147,8 @@ impl Session {
             pacer,
             poll_packet_buf: vec![0; 2000],
             ice_lite: config.ice_lite,
+
+            rtp_mode: config.rtp_mode,
         }
     }
 
@@ -199,9 +204,9 @@ impl Session {
         self.srtp_tx = Some(ctx_tx);
     }
 
-    pub fn handle_timeout(&mut self, now: Instant) {
+    pub fn handle_timeout(&mut self, now: Instant) -> Result<(), RtcError> {
         for m in &mut self.medias {
-            m.handle_timeout(now);
+            m.handle_timeout(now)?;
         }
 
         let sender_ssrc = self.first_ssrc_local();
@@ -239,6 +244,8 @@ impl Session {
         if let Some(bwe) = self.bwe.as_mut() {
             bwe.handle_timeout(now);
         }
+
+        Ok(())
     }
 
     fn create_twcc_feedback(&mut self, sender_ssrc: Ssrc, now: Instant) -> Option<()> {
@@ -396,14 +403,6 @@ impl Session {
 
         let is_rtx = source.is_rtx();
 
-        // The first few packets, the source is in "probation". However for rtx,
-        // we let them straight through, since it would be weird to require probation
-        // time for resends (they are not contiguous) in the receiver register.
-        if !is_rtx && !source.is_valid() {
-            trace!("Source is not (yet) valid, probably probation");
-            return;
-        }
-
         let mut data = match srtp.unprotect_rtp(buf, &header, *seq_no) {
             Some(v) => v,
             None => {
@@ -453,12 +452,6 @@ impl Session {
                 rid = repaired_source.rid();
             }
             let orig_seq_no = repaired_source.update(now, &header, clock_rate);
-            let source = media.get_or_create_source_rx(ssrc);
-
-            if !source.is_valid() {
-                trace!("Repaired source is not (yet) valid, probably probation");
-                return;
-            }
 
             let params = media.get_params(header.payload_type).unwrap();
             if let Some(pt) = params.resend() {
@@ -482,7 +475,11 @@ impl Session {
 
         // This is the "main" PT and it will differ to header.payload_type if this is a resend.
         let pt = params.pt();
-        let codec = params.spec().codec;
+        let codec = if self.rtp_mode {
+            Codec::Null
+        } else {
+            params.spec().codec
+        };
 
         if !media.direction().is_receiving() {
             // Not adding unless we are supposed to be receiving.
@@ -490,14 +487,16 @@ impl Session {
         }
 
         // Buffers are unique per media (since PT is unique per media).
-        let hold_back = if codec.is_audio() {
+        // The hold_back should be configured from param.spec().codec to
+        // avoid the null codec.
+        let hold_back = if params.spec().codec.is_audio() {
             self.reordering_size_audio
         } else {
             self.reordering_size_video
         };
-        let buf = media.get_buffer_rx(pt, rid, codec, hold_back);
+        let buf_rx = media.get_buffer_rx(pt, rid, codec, hold_back);
 
-        let prev_time = buf.max_time().map(|t| t.numer() as u64);
+        let prev_time = buf_rx.max_time().map(|t| t.numer() as u64);
         let extended = extend_u32(prev_time, header.timestamp);
         let time = MediaTime::new(extended as i64, clock_rate as i64);
 
@@ -506,7 +505,17 @@ impl Session {
         // here we have incoming and depacketized data before it may be dropped at buffer.push()
         let bytes_rx = data.len();
 
-        buf.push(meta, data);
+        // In RTP mode we want to retain the header. After srtp_unprotect, we need to
+        // recombine the header + the decrypted payload.
+        if self.rtp_mode {
+            // Write header after the body. This shouldn't allocate since
+            // unprotect_rtp() call above should allocate enough space for the header.
+            data.extend_from_slice(&buf[..meta.header.header_len]);
+            // Rotate so header is before body.
+            data.rotate_right(meta.header.header_len);
+        };
+
+        buf_rx.push(meta, data);
 
         // TODO: is there a nicer way to make borrow-checker happy ?
         // this should go away with the refactoring of the entire handle_rtp() function
@@ -866,7 +875,8 @@ impl Session {
         self.medias.len() + if self.app.is_some() { 1 } else { 0 }
     }
 
-    pub fn add_media(&mut self, media: MediaInner) {
+    pub fn add_media(&mut self, mut media: MediaInner) {
+        media.rtp_mode = self.rtp_mode;
         self.medias.push(media);
     }
 

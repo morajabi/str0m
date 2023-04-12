@@ -191,7 +191,6 @@
 //! ```no_run
 //! # use str0m::Rtc;
 //! # use str0m::media::Mid;
-//! # use std::time::Instant;
 //! # let rtc: Rtc = todo!();
 //! #
 //! // Obtain mid from Event::MediaAdded
@@ -204,7 +203,7 @@
 //! let pt = media.payload_params()[0].pt();
 //!
 //! // Create a media writer for the payload type.
-//! let writer = media.writer(pt, Instant::now());
+//! let writer = media.writer(pt);
 //!
 //! // Write the data
 //! let wallclock = todo!();  // Absolute time of the data
@@ -352,8 +351,28 @@
 //! str0m we would "forward samples").
 //!
 //! Whether this is a good idea is still an open question. It certainly
-//! makes for cleaner abstractions. However there are also plans for an
-//! RTP level API.
+//! makes for cleaner abstractions.
+//!
+//! ### RTP mode
+//!
+//! str0m has a lower level API which let's the user write/receive RTP
+//! packets directly. Using this API requires a deeper knowledge of
+//! RTP and WebRTC and is not recommended for most use cases.
+//!
+//! To enable RTP mode
+//!
+//! ```
+//! # use str0m::Rtc;
+//! let rtc = Rtc::builder()
+//!     // Enable RTP mode for this Rtc instance.
+//!     .set_rtp_mode(true)
+//!     // Don't hold back audio/video packets to attempt
+//!     // to reorder them. Incoming packets are released
+//!     // in the order they are received.
+//!     .set_reordering_size_audio(0)
+//!     .set_reordering_size_video(0)
+//!     .build();
+//! ```
 //!
 //! ## NIC enumeration and TURN (and STUN)
 //!
@@ -1267,16 +1286,16 @@ impl Rtc {
         }
 
         match input {
-            Input::Timeout(now) => self.do_handle_timeout(now),
+            Input::Timeout(now) => self.do_handle_timeout(now)?,
             Input::Receive(now, r) => {
                 self.do_handle_receive(now, r)?;
-                self.do_handle_timeout(now);
+                self.do_handle_timeout(now)?;
             }
         }
         Ok(())
     }
 
-    fn do_handle_timeout(&mut self, now: Instant) {
+    fn do_handle_timeout(&mut self, now: Instant) -> Result<(), RtcError> {
         // We assume this first "now" is a time 0 start point for calculating ntp/unix time offsets.
         // This initializes the conversion of Instant -> NTP/Unix time.
         let _ = now.to_unix_duration();
@@ -1284,12 +1303,13 @@ impl Rtc {
         self.ice.handle_timeout(now);
         self.sctp.handle_timeout(now);
         self.chan.handle_timeout(now, &mut self.sctp);
-        self.session.handle_timeout(now);
+        self.session.handle_timeout(now)?;
         if self.stats.wants_timeout(now) {
             let mut snapshot = StatsSnapshot::new(now);
             self.visit_stats(now, &mut snapshot);
             self.stats.do_handle_timeout(&mut snapshot);
         }
+        Ok(())
     }
 
     fn do_handle_receive(&mut self, now: Instant, r: net::Receive) -> Result<(), RtcError> {
@@ -1433,6 +1453,8 @@ pub struct RtcConfig {
     bwe_initial_bitrate: Option<Bitrate>,
     reordering_size_audio: usize,
     reordering_size_video: usize,
+
+    rtp_mode: bool,
 }
 
 impl RtcConfig {
@@ -1682,6 +1704,32 @@ impl RtcConfig {
         self.reordering_size_video
     }
 
+    /// Make the entire Rtc be in RTP mode.
+    ///
+    /// This means all media, read from [`MediaData`] and written to
+    /// [`Writer::write_rtp()`][crate::media::Writer::write_rtp()] are RTP packetized.
+    /// It bypasses all internal packetization/depacketization inside str0m.
+    ///
+    /// WARNING: This is a low level API and is not str0m's primary use case.
+    pub fn set_rtp_mode(mut self, enabled: bool) -> Self {
+        self.rtp_mode = enabled;
+
+        self
+    }
+
+    /// Checks if RTP mode is set.
+    ///
+    /// ```
+    /// # use str0m::Rtc;
+    /// let config = Rtc::builder();
+    ///
+    /// // Defaults to false.
+    /// assert_eq!(config.rtp_mode(), false);
+    /// ```
+    pub fn rtp_mode(&self) -> bool {
+        self.rtp_mode
+    }
+
     /// Create a [`Rtc`] from the configuration.
     pub fn build(self) -> Rtc {
         Rtc::new_from_config(self)
@@ -1700,6 +1748,8 @@ impl Default for RtcConfig {
             bwe_initial_bitrate: None,
             reordering_size_audio: 15,
             reordering_size_video: 30,
+
+            rtp_mode: false,
         }
     }
 }

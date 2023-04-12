@@ -6,7 +6,7 @@ use crate::format::PayloadParams;
 pub use crate::rtp::VideoOrientation;
 pub use crate::rtp::{Direction, ExtensionValues, MediaTime, Mid, Pt, Rid};
 
-use crate::{Input, Rtc, RtcError};
+use crate::{Rtc, RtcError};
 
 mod event;
 pub use event::*;
@@ -23,6 +23,9 @@ pub(crate) use inner::{MediaInner, Source};
 /// Half internal structures regarding RTP level.
 pub mod rtp {
     pub use crate::rtp::{Extension, ExtensionMap, ExtensionValues};
+
+    // Exposed for integration tests, not for general usage.
+    pub use crate::rtp::RtpHeader;
 }
 
 /// Audio or video media.
@@ -106,10 +109,6 @@ impl Media<'_> {
     /// parameters with the configured ones in this `Media` instance. It's also possible to
     /// manually match the codec using [`Media::payload_params()`].
     ///
-    /// The `now` parameter is required to know the exact time the data is enqueued. This has a
-    /// side effect of driving the time of the `Rtc` instance forward. I.e. passing the `now` here
-    /// is the same driving time forward with `handle_input()`.
-    ///
     /// `rid` is [Rtp Stream Identifier][1]. In classic RTP, individual RTP packets are identified
     /// via an RTP header value `SSRC` (Synchronization Source). However it's been proposed to send
     /// the RID in a header extension as an alternative way, making SSRC less important. Currently
@@ -123,7 +122,6 @@ impl Media<'_> {
     /// # use str0m::Rtc;
     /// # use str0m::media::{MediaData, Mid};
     /// # use str0m::format::PayloadParams;
-    /// # use std::time::Instant;
     /// let mut rtc = Rtc::new();
     ///
     /// // add candidates, do SDP negotiation
@@ -137,11 +135,11 @@ impl Media<'_> {
     /// // Match incoming PT to an outgoing PT.
     /// let pt = media.match_params(data.params).unwrap();
     ///
-    /// media.writer(pt, Instant::now()).write(data.network_time, data.time, &data.data).unwrap();
+    /// media.writer(pt).write(data.network_time, data.time, &data.data).unwrap();
     /// ```
     ///
     /// [1]: https://datatracker.ietf.org/doc/html/rfc8852
-    pub fn writer(&mut self, pt: Pt, now: Instant) -> Writer<'_> {
+    pub fn writer(&mut self, pt: Pt) -> Writer<'_> {
         let media = Media {
             rtc: self.rtc,
             mid: self.mid,
@@ -149,7 +147,6 @@ impl Media<'_> {
 
         Writer {
             media,
-            now,
             pt,
             rid: None,
             ext_vals: ExtensionValues::default(),
@@ -215,7 +212,6 @@ impl Media<'_> {
 /// # use str0m::Rtc;
 /// # use str0m::media::{MediaData, Mid};
 /// # use str0m::format::PayloadParams;
-/// # use std::time::Instant;
 /// let mut rtc = Rtc::new();
 ///
 /// // add candidates, do SDP negotiation
@@ -231,13 +227,12 @@ impl Media<'_> {
 /// let pt = media.match_params(data.params).unwrap();
 ///
 /// // Send data with video orientation added.
-/// media.writer(pt, Instant::now())
+/// media.writer(pt)
 ///     .video_orientation(video_orientation)
 ///     .write(data.network_time, data.time, &data.data).unwrap();
 /// ```
 pub struct Writer<'a> {
     media: Media<'a>,
-    now: Instant,
     pt: Pt,
     rid: Option<Rid>,
     ext_vals: ExtensionValues,
@@ -267,7 +262,7 @@ impl<'a> Writer<'a> {
         self
     }
 
-    /// Do the actual write of media. This consumed the builder.
+    /// Do the actual write of media.
     ///
     /// Regarding `wallclock` and `rtp_time`, the wallclock is the real world time that corresponds to
     /// the `MediaTime`. For an SFU, this can be hard to know, since RTP packets typically only
@@ -280,30 +275,56 @@ impl<'a> Writer<'a> {
     /// doing [`Media::writer()`].
     ///
     /// If you write media before `IceConnectionState` is `Connected` it will be dropped.
+    ///
+    /// Panics if [`RtcConfig::set_rtp_mode()`][crate::RtcConfig::set_rtp_mode] is `true`.
     pub fn write(
         mut self,
         wallclock: Instant,
         rtp_time: MediaTime,
         data: &[u8],
-    ) -> Result<usize, RtcError> {
+    ) -> Result<(), RtcError> {
+        if self.media.inner().rtp_mode {
+            panic!("Can't use MediaWriter::write when in rtp_mode");
+        }
+
         let media = self.media.inner_mut();
 
-        let n = media.write(
-            self.now,
+        media.write(
             self.pt,
             wallclock,
             rtp_time,
             data,
             self.rid,
             self.ext_vals,
+            None,
         )?;
 
-        // Handle_input with a Input::Timeout can't fail, hence the expect.
-        self.media
-            .rtc
-            .handle_input(Input::Timeout(self.now))
-            .expect("handle_input with Timeout to not panic");
+        Ok(())
+    }
 
-        Ok(n)
+    /// Writes a "raw" RTP packet.
+    ///
+    /// For info on `wallclock` see [`Writer::write()`].
+    ///
+    /// The `exts` must contain the mappings for the RTP packet that is written.
+    ///
+    /// Panics if [`RtcConfig::set_rtp_mode()`][crate::RtcConfig::set_rtp_mode] is `false`.
+    ///
+    /// WARNING: This is a low level API and is not str0m's primary use case.
+    pub fn write_rtp(
+        mut self,
+        wallclock: Instant,
+        packet: &[u8],
+        exts: &rtp::ExtensionMap,
+    ) -> Result<(), RtcError> {
+        if !self.media.inner().rtp_mode {
+            panic!("Can't use MediaWriter::write_rtp when not in rtp_mode");
+        }
+
+        let media = self.media.inner_mut();
+
+        media.write_rtp(self.pt, wallclock, packet, exts)?;
+
+        Ok(())
     }
 }

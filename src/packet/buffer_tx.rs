@@ -2,7 +2,7 @@ use std::collections::VecDeque;
 use std::fmt;
 use std::time::{Duration, Instant};
 
-use crate::rtp::{ExtensionValues, MediaTime, Rid, SeqNo, Ssrc};
+use crate::rtp::{ExtensionValues, MediaTime, Rid, RtpHeader, SeqNo, Ssrc};
 
 use super::MediaKind;
 use super::{CodecPacketizer, PacketError, Packetizer, QueueSnapshot};
@@ -11,13 +11,16 @@ pub struct Packetized {
     pub data: Vec<u8>,
     pub first: bool,
     pub marker: bool,
-
     pub meta: PacketizedMeta,
+    pub queued_at: Instant,
 
     /// Set when packet is first sent. This is so we can resend.
     pub seq_no: Option<SeqNo>,
     /// Whether this packetized is counted towards the TotalQueue
     pub count_as_unsent: bool,
+
+    /// If we are in rtp_mode, this is the original incoming header.
+    pub rtp_mode_header: Option<RtpHeader>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -26,8 +29,6 @@ pub struct PacketizedMeta {
     pub ssrc: Ssrc,
     pub rid: Option<Rid>,
     pub ext_vals: ExtensionValues,
-    #[doc(hidden)]
-    pub queued_at: Instant,
 }
 
 #[derive(Debug)]
@@ -43,7 +44,7 @@ pub struct PacketizingBuffer {
 }
 
 impl PacketizingBuffer {
-    pub fn new(pack: CodecPacketizer, max_retain: usize) -> Self {
+    pub(crate) fn new(pack: CodecPacketizer, max_retain: usize) -> Self {
         PacketizingBuffer {
             pack,
             queue: VecDeque::new(),
@@ -58,13 +59,13 @@ impl PacketizingBuffer {
 
     pub fn push_sample(
         &mut self,
+        now: Instant,
         data: &[u8],
         meta: PacketizedMeta,
         mtu: usize,
     ) -> Result<(), PacketError> {
         let chunks = self.pack.packetize(mtu, data)?;
         let len = chunks.len();
-        let now = meta.queued_at;
         self.total.move_time_forward(now);
 
         assert!(len <= self.max_retain, "Must retain at least chunked count");
@@ -76,38 +77,77 @@ impl PacketizingBuffer {
             let previous_data = self.queue.back().map(|p| p.data.as_slice());
             let marker = self.pack.is_marker(data.as_slice(), previous_data, last);
 
-            // The queue_time for a new entry is ZERO since we expect packets to be
-            // enqueued straight away. If we get rid of the now: Instant in media
-            // writing to only rely on handle_timeout, this might not hold true.
             self.total.increase(now, Duration::ZERO, data.len());
 
             let rtp = Packetized {
                 first,
                 marker,
                 data,
-
                 meta,
+                queued_at: now,
 
                 seq_no: None,
                 count_as_unsent: true,
+
+                rtp_mode_header: None,
             };
 
             self.queue.push_back(rtp);
         }
 
-        // Scale back retained count to max_retain
+        self.size_down_to_retained(now);
+
+        Ok(())
+    }
+
+    pub fn push_rtp_packet(
+        &mut self,
+        now: Instant,
+        data: Vec<u8>,
+        meta: PacketizedMeta,
+        rtp_header: RtpHeader,
+    ) {
+        self.total.move_time_forward(now);
+
+        self.total.increase(now, Duration::ZERO, data.len());
+
+        let rtp = Packetized {
+            first: true,
+            marker: rtp_header.marker,
+            data,
+            meta,
+            queued_at: now,
+
+            // don't set seq_no yet since it's used to determine if packet has been sent or not.
+            seq_no: None,
+            count_as_unsent: true,
+
+            rtp_mode_header: Some(rtp_header),
+        };
+
+        self.queue.push_back(rtp);
+
+        self.size_down_to_retained(now);
+    }
+
+    /// Scale back retained count to max_retain
+    fn size_down_to_retained(&mut self, now: Instant) {
         while self.queue.len() > self.max_retain {
             let p = self.queue.pop_front();
             if let Some(p) = p {
                 if p.count_as_unsent {
-                    let queue_time = now - p.meta.queued_at;
+                    let queue_time = now - p.queued_at;
                     self.total.decrease(p.data.len(), queue_time);
                 }
             }
+            if self.emit_next == 0 {
+                // This probably means the user is doing a lot of MediaWriter::write()
+                // without interspersing it with Rtc::poll_output() or maybe doing
+                // writes before the Connected event.
+                panic!("Resize down PacketizingBuffer when emit_next is at 0");
+            }
             self.emit_next -= 1;
         }
-
-        Ok(())
     }
 
     pub fn poll_next(&mut self, now: Instant) -> Option<&mut Packetized> {
@@ -115,7 +155,7 @@ impl PacketizingBuffer {
         let next = self.queue.get_mut(self.emit_next)?;
         if next.count_as_unsent {
             next.count_as_unsent = false;
-            let queue_time = now - next.meta.queued_at;
+            let queue_time = now - next.queued_at;
             self.total.decrease(next.data.len(), queue_time);
         }
         self.emit_next += 1;
@@ -125,38 +165,6 @@ impl PacketizingBuffer {
 
     pub fn get(&self, seq_no: SeqNo) -> Option<&Packetized> {
         self.queue.iter().find(|r| r.seq_no == Some(seq_no))
-    }
-
-    // Used when we get a resend to account for resends in the TotalQueue.
-    pub fn mark_as_unaccounted(&mut self, now: Instant, seq_no: SeqNo) {
-        self.total.move_time_forward(now);
-        let Some(p) = self.queue.iter_mut().find(|r| r.seq_no == Some(seq_no)) else {
-            return;
-        };
-
-        if !p.count_as_unsent {
-            p.count_as_unsent = true;
-            let queue_time = now - p.meta.queued_at;
-            self.total.increase(now, queue_time, p.data.len());
-        }
-    }
-
-    // Used when we handle a resend to update TotalQueue.
-    pub fn get_and_unmark_as_accounted(
-        &mut self,
-        now: Instant,
-        seq_no: SeqNo,
-    ) -> Option<&Packetized> {
-        self.total.move_time_forward(now);
-        let p = self.queue.iter_mut().find(|r| r.seq_no == Some(seq_no))?;
-
-        if p.count_as_unsent {
-            p.count_as_unsent = false;
-            let queue_time = now - p.meta.queued_at;
-            self.total.decrease(p.data.len(), queue_time);
-        }
-
-        Some(p)
     }
 
     pub fn has_ssrc(&self, ssrc: Ssrc) -> bool {
@@ -183,7 +191,7 @@ impl PacketizingBuffer {
             packet_count: self.total.unsent_count as u32,
             total_queue_time_origin: self.total.queue_time,
             last_emitted: self.last_emit,
-            first_unsent: self.queue.get(self.emit_next).map(|p| p.meta.queued_at),
+            first_unsent: self.queue.get(self.emit_next).map(|p| p.queued_at),
         }
     }
 
